@@ -3,7 +3,7 @@ package resources
 import (
 	"container/list"
 	"encoding/gob"
-	. "g14-mp3/failureDetector"
+	. "g14-mp4/failureDetector"
 )
 
 func init() {
