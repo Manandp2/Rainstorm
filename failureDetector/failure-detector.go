@@ -102,6 +102,8 @@ type Detector struct {
 	}
 
 	listener      *net.UDPConn
+	rpcPort       string
+	udpPort       string
 	beatingTicker *time.Ticker
 
 	leaveChan       chan struct{}
@@ -116,7 +118,7 @@ const gossipFrequency = time.Millisecond * 500
 const pingFrequency = time.Millisecond * 250
 const failureTime = time.Second*1 + time.Millisecond*300
 
-func (d *Detector) Init() {
+func (d *Detector) Init(rpcPort, updPort string) {
 	hd, _ := os.UserHomeDir()
 	d.logFile, _ = os.OpenFile(filepath.Join(hd, "failureDetector.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	d.list = make(map[NodeId]localMembership)
@@ -126,8 +128,10 @@ func (d *Detector) Init() {
 		d.logFatal(err)
 	}
 	// VM 1 is always the introducer
+	d.rpcPort = rpcPort
+	d.udpPort = updPort
 	go func() {
-		rpcListener, err := net.Listen("tcp", ":8002")
+		rpcListener, err := net.Listen("tcp", rpcPort)
 		if err != nil {
 			d.logFatal(err)
 		}
@@ -386,7 +390,7 @@ func (d *Detector) Start() {
 					if packet.IsPing { // need to send ack back
 						d.updateMembershipList(&packet.Memberships)
 						go func(addr net.Addr) { // send the ack
-							s := strings.Split(addr.String(), ":")[0] + ":8001"
+							s := strings.Split(addr.String(), ":")[0] + d.udpPort
 							r, _ := net.ResolveUDPAddr("udp", s)
 							conn, err := net.DialUDP("udp", nil, r)
 							if err != nil {
@@ -597,7 +601,7 @@ func (d *Detector) introduceMyself() {
 	}
 
 	// Open the port for failure listening, if this fails no point to join
-	addr, err := net.ResolveUDPAddr("udp", ":8001")
+	addr, err := net.ResolveUDPAddr("udp", d.udpPort)
 	d.listener, err = net.ListenUDP("udp", addr)
 	if err != nil {
 		d.logFatal(err)
@@ -605,7 +609,7 @@ func (d *Detector) introduceMyself() {
 
 	if name, _ := os.Hostname(); name != "fa25-cs425-1401.cs.illinois.edu" {
 		// hello introducer
-		server, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu:8002")
+		server, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+d.rpcPort)
 		if err != nil {
 			d.logFatal(err)
 		}
@@ -665,7 +669,7 @@ func (d *Detector) updateProtocol() {
 		if n == d.MyNode {
 			continue
 		}
-		server, _ := rpc.Dial("tcp", n.IP()+":8002")
+		server, _ := rpc.Dial("tcp", n.IP()+d.rpcPort)
 		var reply1 bool
 		var reply2 bool
 		server.Go("SwitchProtocol.SwitchSuspicion", d.config.suspicionOn, &reply1, nil)
