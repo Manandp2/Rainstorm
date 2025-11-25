@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	. "g14-mp3/mp1/resources/rpc-api"
+	. "g14-mp4/mp1/resources/rpc-api"
 	"net/rpc"
 	"os"
 	"path/filepath"

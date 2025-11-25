@@ -3,7 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
-	. "g14-mp3/mp1/resources/rpc-api"
+	. "g14-mp4/mp1/resources/rpc-api"
 	"io"
 	"net/rpc"
 	"os"

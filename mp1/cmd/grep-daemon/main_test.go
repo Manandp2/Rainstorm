@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	. "g14-mp3/mp1/resources/rpc-api"
+	. "g14-mp4/mp1/resources/rpc-api"
 	"math/rand"
 	"os"
 	"path/filepath"
