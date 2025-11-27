@@ -62,7 +62,7 @@ func (s *Server) init() {
 	_ = os.Mkdir(folderName, 0777)
 
 	// Get membership list setup
-	s.detector.Init()
+	s.detector.Init(":8001", ":8002")
 }
 
 func (s *Server) server() {
