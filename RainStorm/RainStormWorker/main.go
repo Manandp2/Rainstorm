@@ -202,7 +202,12 @@ func main() {
 
 						// De-duplication
 						if _, ok := worker.receivedTuples[split[0]]; ok {
-							// TODO: de-duplicate using a map, key is tuple tupleId = (sender IP+Local Counter), value is bool - processed or not
+							// We have already received this tuple, send an ack back
+							ackMsg := fmt.Sprintf("%s-%s\n", split[0], ACK)
+							_, _ = fmt.Fprintf(conn, ackMsg)
+							continue
+						} else {
+							worker.receivedTuples[split[0]] = true
 						}
 
 						// find the correct task
