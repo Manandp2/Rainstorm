@@ -35,6 +35,8 @@ type taskOutput struct {
 	output  string
 }
 type Worker struct {
+	rainStormLeader *rpc.Client // used to send task completions
+
 	done        chan bool
 	tasksLocker sync.Mutex
 	tasks       map[taskID]localTask
@@ -60,7 +62,7 @@ const clientTimeout = time.Second * 3
 const ACK = "ACK"
 
 func main() {
-	leader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu:8020")
+	leader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+IntroducePort)
 	if err != nil {
 		return
 	}
@@ -73,13 +75,18 @@ func main() {
 	_ = leader.Close()
 	for {
 		server := rpc.NewServer()
-		worker := Worker{
-			done:        make(chan bool),
-			tasks:       make(map[taskID]localTask),
-			taskOutputs: make(chan taskOutput, 100),
-			connections: make(map[string]*WorkerClient),
+		rainStormLeader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+GlobalRMPort)
+		if err != nil {
+			continue // try again
 		}
-		err := server.Register(&worker)
+		worker := Worker{
+			rainStormLeader: rainStormLeader,
+			done:            make(chan bool),
+			tasks:           make(map[taskID]localTask),
+			taskOutputs:     make(chan taskOutput, 100),
+			connections:     make(map[string]*WorkerClient),
+		}
+		err = server.Register(&worker)
 		if err != nil {
 			return
 		}
@@ -322,7 +329,11 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			}
 			counter++
 		}
-		// TODO: send rpc to the leader saying the task is complete
+		var reply int
+		err := w.rainStormLeader.Call("RainStorm.ReceiveTaskCompletion", t, &reply)
+		if err != nil {
+			return
+		}
 	}(taskStdout, tId, w.taskOutputs)
 
 	w.tasksLocker.Lock()
