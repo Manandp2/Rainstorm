@@ -148,7 +148,7 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 }
 
 func (app *RainStorm) ReceiveTaskCompletion(args, reply *int) error {
-
+	//@TODO: stage completion manager --> manage tags from tasks and send out EOF to tasks when previous stage is done
 }
 
 func (app *RainStorm) sendIps() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> only called when current app is modified
