@@ -28,9 +28,10 @@ type RainStorm struct {
 	LowestRate               int
 	HighestRate              int
 	Ops                      []Operation
-	Ips                      [][]net.IP // [stage][task]
+	Ips                      []map[string]net.IP // [stage][task] --> IP
+	CurNumTasks              []int               //[stage]
 	NextAvailableVM          int
-	Lock                     sync.Mutex //@TODO: add locks when accessing the rainstorm object
+	Lock                     *sync.RWMutex //@TODO: add locks when accessing the rainstorm object
 }
 
 var workers WorkerIps
@@ -59,8 +60,7 @@ func main() {
 
 	for {
 		r := <-input
-		r.Ips = make([][]net.IP, r.NumStages)
-		//r.tasksAtWorker = make(map[string][]resources.Task) //consider adding a lock for this b/c of Global RM
+		// INITIATE NEW RAINSTORM APPLICATION
 		workers.l.Lock()
 		numWorkers = len(workers.ips)
 		rpcWorkers = make(map[string]*rpc.Client)
@@ -78,16 +78,19 @@ func main() {
 		}
 		rpcWorkersLock.Unlock()
 
+		r.Lock.Lock()
+		r.Ips = make([]map[int]net.IP, r.NumStages)
 		r.NextAvailableVM = 0
 		for i := range r.NumStages {
-			r.Ips[i] = make([]net.IP, r.NumTasksPerStage)
-			for j := range r.NumTasksPerStage {
-				r.addTask(i, j)
+			r.Ips[i] = make(map[int]net.IP)
+			for _ = range r.NumTasksPerStage {
+				r.addTask(i)
 			}
 		}
 		workers.l.Unlock()
 		r.sendIps()
 		r.sendOpNames()
+		r.Lock.Unlock()
 
 		//Global RM
 		/*
@@ -109,10 +112,14 @@ func main() {
 		}
 		go appServer.Accept(globalRmListener)
 
+		// @TODO: needs to wait for the application to complete before cleaning up
+
 		// CLEANUP: do once the current RainStorm application is done
+		workers.l.Lock()
 		for _, worker := range rpcWorkers {
 			_ = worker.Close()
 		}
+		workers.l.Unlock()
 
 		err = globalRmListener.Close()
 		if err != nil {
@@ -123,29 +130,33 @@ func main() {
 }
 
 func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
+	app.Lock.Lock()
+	defer app.Lock.Unlock()
 	if app.AutoScale {
 		if args.Rate < app.LowestRate {
-			//	add a task in this stage
+			//	add a task to this stage
 			workers.l.Lock()
-			app.addTask(args.Stage, len(app.Ips[args.Stage]))
+			app.addTask(args.Stage)
 			workers.l.Unlock()
 			app.sendIps()
 		} else if args.Rate > app.HighestRate {
-			//	remove a task in this stage
+			//	remove a task from this stage
 			app.removeTask(args.Stage, len(app.Ips[args.Stage]))
 		}
 	}
 	return nil
 }
 
-func (app *RainStorm) sendIps() {
+func (app *RainStorm) sendIps() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> only called when current app is modified
 	waitingChan := make(chan *rpc.Call, len(rpcWorkers))
 	numSuccess := 0
+	rpcWorkersLock.RLock()
 	for _, worker := range rpcWorkers {
 		var reply int
 		worker.Go("Worker.ReceiveIPs", app.Ips, &reply, waitingChan)
 		numSuccess++
 	}
+	rpcWorkersLock.RUnlock()
 	for i := 0; i < numSuccess; i++ {
 		x := <-waitingChan
 		if x.Error != nil {
@@ -154,14 +165,16 @@ func (app *RainStorm) sendIps() {
 	}
 }
 
-func (app *RainStorm) sendOpNames() {
+func (app *RainStorm) sendOpNames() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> only called when current app is modified
 	waitingChan := make(chan *rpc.Call, len(rpcWorkers))
 	numSuccess := 0
+	rpcWorkersLock.RLock()
 	for _, worker := range rpcWorkers {
 		var reply int
 		worker.Go("Worker.ReceiveOpNames", app.Ops, &reply, waitingChan)
 		numSuccess++
 	}
+	rpcWorkersLock.RUnlock()
 	for i := 0; i < numSuccess; i++ {
 		x := <-waitingChan
 		if x.Error != nil {
@@ -170,23 +183,26 @@ func (app *RainStorm) sendOpNames() {
 	}
 }
 
-func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN LOCK WHEN CALLED
-	if taskNum >= len(app.Ips[stageNum]) {
-		app.Ips[stageNum] = append(app.Ips[stageNum], workers.ips[app.NextAvailableVM%numWorkers])
-	} else {
-		app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
-	}
+func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CALLED
+	//if taskNum > app.StageCounter[stageNum]) {
+	//	app.Ips[stageNum] = append(app.Ips[stageNum], workers.ips[app.NextAvailableVM%numWorkers])
+	//} else {
+	//	app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
+	//}
+	taskNum := app.CurNumTasks[stageNum]
+	app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
+	app.CurNumTasks[stageNum]++
+	app.NextAvailableVM++
 	task := Task{
 		TaskNumber: taskNum,
 		Stage:      stageNum,
 		Executable: app.Ops[stageNum],
 	}
-	app.NextAvailableVM++
 
 	var reply int
-	rpcWorkersLock.Lock()
+	rpcWorkersLock.RLock()
 	rpcWorker := rpcWorkers[app.Ips[stageNum][taskNum].String()]
-	rpcWorkersLock.Unlock()
+	rpcWorkersLock.RUnlock()
 	err := rpcWorker.Call("Worker.AddTask", task, &reply)
 	if err != nil {
 		fmt.Println("Failed to send request to add task: " + err.Error())
@@ -194,11 +210,11 @@ func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN 
 }
 
 func (app *RainStorm) removeTask(stageNum int, taskNum int) {
-	deletedTaskIp := app.Ips[stageNum][len(app.Ips[stageNum])-1]
-	if len(app.Ips[stageNum]) != 0 {
-		app.Ips[stageNum] = app.Ips[stageNum][:len(app.Ips[stageNum])-1] //go garbage collector will clean up the last element
-	}
-
+	deletedTaskIp := app.Ips[stageNum][taskNum]
+	//if len(app.Ips[stageNum]) != 0 {
+	//	app.Ips[stageNum] = app.Ips[stageNum][:len(app.Ips[stageNum])-1] //go garbage collector will clean up the last element
+	//}
+	delete(app.Ips[stageNum], taskNum)
 	app.sendIps()
 
 	task := Task{
@@ -207,9 +223,9 @@ func (app *RainStorm) removeTask(stageNum int, taskNum int) {
 		Executable: app.Ops[stageNum],
 	}
 	var reply int
-	rpcWorkersLock.Lock()
+	rpcWorkersLock.RLock()
 	rpcWorker := rpcWorkers[deletedTaskIp.String()]
-	rpcWorkersLock.Unlock()
+	rpcWorkersLock.RUnlock()
 	err := rpcWorker.Call("Worker.KillTask", task, &reply)
 	if err != nil {
 		fmt.Println("Failed to send request to kill task: " + err.Error())
