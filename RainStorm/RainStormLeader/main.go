@@ -147,6 +147,10 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 	return nil
 }
 
+func (app *RainStorm) ReceiveTaskCompletion(args, reply *int) error {
+
+}
+
 func (app *RainStorm) sendIps() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> only called when current app is modified
 	waitingChan := make(chan *rpc.Call, len(rpcWorkers))
 	numSuccess := 0
