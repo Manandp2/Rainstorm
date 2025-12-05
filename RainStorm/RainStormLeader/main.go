@@ -30,10 +30,9 @@ type RainStorm struct {
 	HighestRate              int
 	Ops                      []Operation
 	Ips                      []map[int]net.IP // [stage][task] --> IP
-	//TaskCompletion           []CompletionTuple // [stage][task] --> {Counter, map[task] --> bool of if finished}
-	NextTaskNum     []int // [stage]
-	NextAvailableVM int
-	Lock            *sync.Mutex //@TODO: add locks when accessing the rainstorm object
+	NextTaskNum              []int            // [stage]
+	NextAvailableVM          int
+	Lock                     *sync.Mutex
 }
 
 var workers WorkerIps
@@ -174,7 +173,7 @@ func (app *RainStorm) ReceiveTaskCompletion(args Task, reply *int) error {
 		if len(app.Ips[args.Stage]) == 0 {
 			// stage completed
 			if args.Stage+1 < app.NumStages {
-				app.sendStageCompletion(args.Stage + 1)
+				app.sendStageCompletion(args.Stage)
 			} else {
 				appCompletedChan <- true
 			}
@@ -187,9 +186,22 @@ func (app *RainStorm) ReceiveTaskCompletion(args Task, reply *int) error {
 	return nil
 }
 
-func (app *RainStorm) sendStageCompletion(sendingStage int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
-	// @TODO: send out "EOF" to stage when previous stage is done
-
+func (app *RainStorm) sendStageCompletion(completedStage int) {
+	waitingChan := make(chan *rpc.Call, len(rpcWorkers))
+	numSuccess := 0
+	rpcWorkersLock.RLock()
+	for _, worker := range rpcWorkers {
+		var reply int
+		worker.Go("Worker.ReceiveFinishedStage", completedStage, &reply, waitingChan)
+		numSuccess++
+	}
+	rpcWorkersLock.RUnlock()
+	for i := 0; i < numSuccess; i++ {
+		x := <-waitingChan
+		if x.Error != nil {
+			fmt.Println("Failed to send completed stageID to workers: " + x.Error.Error())
+		}
+	}
 }
 
 func (app *RainStorm) sendIps() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> only called when current app is modified
@@ -261,7 +273,7 @@ func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CAL
 }
 
 func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
-	if len(app.Ips[stageNum]) <= 1 { // only 1 task remaining in the stage
+	if len(app.Ips[stageNum]) <= 1 {             // only 1 task remaining in the stage
 		return
 	}
 	var taskNum int
