@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	. "g14-mp4/RainStorm/resources"
 	"g14-mp4/mp3/resources"
@@ -113,7 +115,6 @@ func main() {
 				// On output of tuple from a task, send it to the next task
 				out := <-worker.taskOutputs
 				nextStage := out.taskId.stage + 1
-				// TODO: write processed for current tuple to HyDFS
 				var r resources.AppendReply
 				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.stage, out.taskId.task),
@@ -171,7 +172,7 @@ func main() {
 
 					// Send the tuple
 					_ = client.conn.SetWriteDeadline(time.Now().Add(clientTimeout))
-					// Id-Id,stage, task, data
+					// Id-Id, stage, task, data
 					_, err = fmt.Fprintf(client.conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
 
 					if err != nil { // Write didn't go through, disconnect and try again
@@ -256,10 +257,9 @@ func main() {
 							continue
 						}
 						var r resources.AppendReply
-						// TODO: write received for current tuple to HyDFS
 						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 							RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
-							Content:    []byte(fmt.Sprintf("RECIEVED-%s", split[3])),
+							Content:    []byte(fmt.Sprintf("RECEIVED-%s", split[3])),
 						}, &r, nil)
 					}
 				}(conn)
@@ -331,7 +331,9 @@ func (w *Worker) ReceiveIPs(ips []map[int]net.IP, reply *int) error {
 }
 
 func (w *Worker) AddTask(t Task, reply *int) error {
-	task := exec.Command(string(t.Executable.Name), t.Executable.Args)
+	// Set up the task and its pipes
+	cmdArgs := strings.Fields(t.Executable.Args)
+	task := exec.Command(string(t.Executable.Name), cmdArgs...)
 	taskStdin, err := task.StdinPipe()
 	if err != nil {
 		return err
@@ -346,27 +348,8 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 	if err != nil {
 		return err
 	}
-	// TODO: go through log file for task and add any received but not processed tuples to taskStdin
-	// First check if this is the first time this task is getting created
-	var createReply []resources.AddFileReply
-	taskLogFile := fmt.Sprintf("%s_%d-%d", w.rainStormStartTime, t.Stage, t.TaskNumber)
-	err = w.hydfsClient.Call("Client.RemoteCreate", &resources.RemoteFileArgs{
-		RemoteName: taskLogFile,
-		Content:    make([]byte, 0),
-	}, &createReply)
-	if err != nil {
-		return err
-	}
-	recoveredTask := false
-	for _, fileReply := range createReply {
-		if fileReply.Err != nil { // file already exists
-			recoveredTask = true
-		}
-	}
-	if recoveredTask { // Need to go through the log file and get all the tuples that haven't been processed yet
-		var contents []byte
-		err = w.hydfsClient.Call("Client.RemoteGet", taskLogFile, &contents)
-	}
+
+	// Connect the task's pipe to the channel
 	tId := taskToTaskId(t)
 	go func(pipe io.Reader, t taskID, c chan<- taskOutput, cmd *exec.Cmd) {
 		scanner := bufio.NewScanner(pipe)
@@ -394,6 +377,7 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		}
 	}(taskStdout, tId, w.taskOutputs, task)
 
+	// Add the task to the map
 	w.tasksLocker.Lock()
 	w.tasks[tId] = localTask{
 		cmd:    task,
@@ -401,6 +385,61 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		output: taskStdout,
 	}
 	w.tasksLocker.Unlock()
+
+	// Check if the task has any tuples it needs to recover
+
+	// First, check if this is the first time this task is getting created
+	var createReply []resources.AddFileReply
+	taskLogFile := fmt.Sprintf("%s_%d-%d", w.rainStormStartTime, t.Stage, t.TaskNumber)
+	err = w.hydfsClient.Call("Client.RemoteCreate", &resources.RemoteFileArgs{
+		RemoteName: taskLogFile,
+		Content:    make([]byte, 0),
+	}, &createReply)
+	if err != nil {
+		return err
+	}
+	recoveredTask := false
+	for _, fileReply := range createReply {
+		var e *resources.FileAlreadyExistsError
+		if errors.As(fileReply.Err, &e) { // file already exists, so this is a recovery
+			recoveredTask = true
+		}
+	}
+
+	if recoveredTask {
+		// Need to go through the log file and get all the tuples that haven't been processed yet
+		var contents []byte
+		err = w.hydfsClient.Call("Client.RemoteGet", taskLogFile, &contents)
+		scanner := bufio.NewScanner(bytes.NewReader(contents))
+
+		// Mark all processed tuples
+		tuples := make(map[string]bool)
+		for scanner.Scan() {
+			splits := strings.SplitN(scanner.Text(), "-", 2)
+			if len(splits) != 2 {
+				continue
+			}
+			_, exists := tuples[splits[1]]
+			if exists && splits[0] == "PROCESSED" {
+				tuples[splits[1]] = true
+			} else if !exists && splits[0] == "RECEIVED" {
+				tuples[splits[1]] = false
+			} else {
+				fmt.Println("This should not have happened, Error processing file ", splits[1])
+			}
+		}
+
+		// Add all unmarked tuples
+		for tuple, processed := range tuples {
+			if !processed {
+				_, err = io.WriteString(taskStdin, tuple+"\n")
+				if err != nil {
+					fmt.Println("Error writing tuple to task ", tuple, err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
