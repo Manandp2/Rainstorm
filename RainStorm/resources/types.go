@@ -1,7 +1,5 @@
 package resources
 
-import "net"
-
 const IntroducePort = ":8020"
 const AssignmentPort = ":8021"
 const TuplePort = ":8022"
@@ -25,12 +23,6 @@ type Task struct {
 	TaskNumber int
 	Stage      int
 	Executable Operation
-}
-
-type WorkerInfo struct {
-	Task     Task
-	Ips      [][]net.IP
-	StageOps []string
 }
 
 type RmUpdate struct {
