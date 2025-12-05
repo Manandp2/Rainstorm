@@ -219,7 +219,6 @@ func (c *Client) addContentAtNodes(localName string, remoteName string, numNodes
 			return err
 		}
 
-		// Restore CLI behavior: Print errors if any replica failed
 		for _, reply := range replies {
 			if reply.Err != nil {
 				var existsErr *resources.FileAlreadyExistsError
@@ -240,22 +239,39 @@ func (c *Client) addContentAtNodes(localName string, remoteName string, numNodes
 	}
 }
 
-func (c *Client) getFile(remoteFile, localFile string) error {
+// fetchFileContent handles finding a replica and retrieving the file content via RPC
+func (c *Client) fetchFileContent(remoteFile string) ([]byte, error) {
 	nodes, err := c.getReplicaNodes(remoteFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
 	randReplicaIdx := rand.Intn(len(nodes))
 	replicaNode := nodes[randReplicaIdx]
+
 	var reply []byte
 	curServer, err := rpc.Dial("tcp", replicaNode.IP()+":8010")
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer func(curServer *rpc.Client) {
+		_ = curServer.Close()
+	}(curServer)
+
 	err = curServer.Call("Server.Get", &remoteFile, &reply)
 	if err != nil {
-		return &resources.FileNotFoundError{FileName: remoteFile}
+		return nil, &resources.FileNotFoundError{FileName: remoteFile}
 	}
+
+	return reply, nil
+}
+
+func (c *Client) getFile(remoteFile, localFile string) error {
+	content, err := c.fetchFileContent(remoteFile)
+	if err != nil {
+		return err
+	}
+
 	file, err := os.Create(localFile)
 	if err != nil {
 		return err
@@ -264,7 +280,7 @@ func (c *Client) getFile(remoteFile, localFile string) error {
 		_ = file.Close()
 	}()
 
-	_, err = file.Write(reply)
+	_, err = file.Write(content)
 	if err != nil {
 		return err
 	}
@@ -326,7 +342,6 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 	c.appendNumbersMutex.Lock()
 	defer c.appendNumbersMutex.Unlock()
 
-	// 1. Ask Coordinator for replica locations
 	nodes, err := c.getReplicaNodes(remoteName)
 	if err != nil {
 		return nil, err
@@ -335,12 +350,10 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 	serversCalled := 0
 	waitChan := make(chan *rpc.Call, numNodesWanted)
 
-	// We create the slice here to hold the responses
 	replies := make([]resources.AddFileReply, numNodesWanted)
 
 	randNum := rand.Intn(len(nodes))
 
-	// 2. Send to DataNodes
 	for i := 0; i < numNodesWanted; i++ {
 		curNode := nodes[(randNum+i)%len(nodes)]
 
@@ -355,27 +368,22 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 
 		curServer, err := rpc.Dial("tcp", curNode.IP()+":8010")
 		if err == nil {
-			// We pass &replies[i] so the RPC fills that specific slot
 			curServer.Go(fmt.Sprintf("Server.%s", addType), &args, &replies[i], waitChan)
 			serversCalled++
 		}
 	}
 
-	// 3. Wait for all calls to finish
-	// We don't strictly need to read the errors here since we are returning the whole slice,
-	// but we must wait for the calls to complete.
 	for i := 0; i < serversCalled; i++ {
 		<-waitChan
 	}
 
 	c.appendNumber++
 
-	// Return the populated slice of replies
 	return replies, nil
 }
 
 // RemoteAppend is used to append to a file from a remote client
-func (c *Client) RemoteAppend(args *resources.RemoteFileArgs, reply *[]resources.AddFileReply) error {
+func (c *Client) RemoteAppend(args *resources.RemoteFileArgs, reply *[]resources.AppendReply) error {
 	responses, err := c.sendDataToNodes(args.RemoteName, args.Content, 2, appendRpc)
 	if err != nil {
 		return err
@@ -391,5 +399,15 @@ func (c *Client) RemoteCreate(args *resources.RemoteFileArgs, reply *[]resources
 		return err
 	}
 	*reply = responses
+	return nil
+}
+
+// RemoteGet is used to read a file from a remote client (e.g., RainStorm worker)
+func (c *Client) RemoteGet(args string, reply *[]byte) error {
+	content, err := c.fetchFileContent(args)
+	if err != nil {
+		return err
+	}
+	*reply = content
 	return nil
 }

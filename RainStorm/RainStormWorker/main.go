@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	. "g14-mp4/RainStorm/resources"
+	"g14-mp4/mp3/resources"
 	"io"
 	"net"
 	"net/rpc"
 	"os/exec"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +36,9 @@ type taskOutput struct {
 	output  string
 }
 type Worker struct {
-	rainStormLeader *rpc.Client // used to send task completions
+	rainStormLeader    *rpc.Client // used to send task completions
+	rainStormStartTime string
+	hydfsClient        *rpc.Client
 
 	done        chan bool
 	tasksLocker sync.Mutex
@@ -73,6 +76,11 @@ func main() {
 		return
 	}
 	_ = leader.Close()
+	hydfsClient, err := rpc.Dial("tcp", "localhost:8011") // connect to our own HydFS client
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	for {
 		server := rpc.NewServer()
 		rainStormLeader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+GlobalRMPort)
@@ -81,6 +89,7 @@ func main() {
 		}
 		worker := Worker{
 			rainStormLeader: rainStormLeader,
+			hydfsClient:     hydfsClient,
 			done:            make(chan bool),
 			tasks:           make(map[taskID]localTask),
 			taskOutputs:     make(chan taskOutput, 100),
@@ -105,6 +114,11 @@ func main() {
 				out := <-worker.taskOutputs
 				nextStage := out.taskId.stage + 1
 				// TODO: write processed for current tuple to HyDFS
+				var r resources.AppendReply
+				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.stage, out.taskId.task),
+					Content:    []byte(fmt.Sprintf("PROCESSED-%s", out.output)),
+				}, &r, nil)
 				if nextStage < len(worker.ips) { // send it to the next stage
 					key := out.output
 					if worker.stageOperations[nextStage].Name == AggregateByKey {
@@ -230,16 +244,23 @@ func main() {
 						// write to task
 						targetTask := taskID{stage: stage, task: task}
 						worker.tasksLocker.Lock()
-						_, _ = io.WriteString(worker.tasks[targetTask].input, split[3])
+						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
 						worker.tasksLocker.Unlock()
-
+						if err != nil {
+							continue // we weren't able to write, so no ack
+						}
 						// send the ack
 						ackMsg := fmt.Sprintf("%s-%s\n", split[0], ACK)
 						_, err = fmt.Fprintf(conn, ackMsg)
 						if err != nil {
 							continue
 						}
+						var r resources.AppendReply
 						// TODO: write received for current tuple to HyDFS
+						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+							RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
+							Content:    []byte(fmt.Sprintf("RECIEVED-%s", split[3])),
+						}, &r, nil)
 					}
 				}(conn)
 			}
@@ -247,6 +268,7 @@ func main() {
 
 		<-worker.done
 		_ = leaderListener.Close()
+		_ = rainStormLeader.Close()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
 	}
 
@@ -271,14 +293,22 @@ func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 	defer w.tasksLocker.Unlock()
 	for key, value := range w.tasks {
 		if key.stage == stage+1 {
-			_ = value.output.Close()
+			_ = value.input.Close()
 		}
 	}
 	return nil
 }
 
-func (w *Worker) ReceiveStages(stageOps []Operation, reply *int) error {
+func (w *Worker) AutoscaleDown(t taskID, reply *int) error {
+	w.tasksLocker.Lock()
+	defer w.tasksLocker.Unlock()
+	_ = w.tasks[t].input.Close()
+	return nil
+}
+
+func (w *Worker) Initialize(stageOps []Operation, reply *int) error {
 	w.stageOperations = stageOps
+	// TODO: get starting time of rainstorm task, use time.Format("20060102150405")
 	return nil
 }
 
@@ -295,7 +325,7 @@ func (w *Worker) ReceiveIPs(ips []map[int]net.IP, reply *int) error {
 		for task := range tasks {
 			w.sortedTaskIDs[stage] = append(w.sortedTaskIDs[stage], task)
 		}
-		sort.Ints(w.sortedTaskIDs[stage])
+		slices.Sort(w.sortedTaskIDs[stage])
 	}
 	return nil
 }
@@ -317,8 +347,28 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		return err
 	}
 	// TODO: go through log file for task and add any received but not processed tuples to taskStdin
+	// First check if this is the first time this task is getting created
+	var createReply []resources.AddFileReply
+	taskLogFile := fmt.Sprintf("%s_%d-%d", w.rainStormStartTime, t.Stage, t.TaskNumber)
+	err = w.hydfsClient.Call("Client.RemoteCreate", &resources.RemoteFileArgs{
+		RemoteName: taskLogFile,
+		Content:    make([]byte, 0),
+	}, &createReply)
+	if err != nil {
+		return err
+	}
+	recoveredTask := false
+	for _, fileReply := range createReply {
+		if fileReply.Err != nil { // file already exists
+			recoveredTask = true
+		}
+	}
+	if recoveredTask { // Need to go through the log file and get all the tuples that haven't been processed yet
+		var contents []byte
+		err = w.hydfsClient.Call("Client.RemoteGet", taskLogFile, &contents)
+	}
 	tId := taskToTaskId(t)
-	go func(pipe io.Reader, t taskID, c chan<- taskOutput) {
+	go func(pipe io.Reader, t taskID, c chan<- taskOutput, cmd *exec.Cmd) {
 		scanner := bufio.NewScanner(pipe)
 		counter := 0
 		for scanner.Scan() {
@@ -329,12 +379,20 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			}
 			counter++
 		}
-		var reply int
-		err := w.rainStormLeader.Call("RainStorm.ReceiveTaskCompletion", t, &reply)
-		if err != nil {
+
+		if scanner.Err() != nil {
+			fmt.Println("Scanner error:", scanner.Err())
 			return
 		}
-	}(taskStdout, tId, w.taskOutputs)
+
+		err = cmd.Wait()
+		if err == nil {
+			var reply int
+			_ = w.rainStormLeader.Call("RainStorm.ReceiveTaskCompletion", t, &reply)
+		} else {
+			fmt.Printf("Task %v failed: %v\n", t, err)
+		}
+	}(taskStdout, tId, w.taskOutputs, task)
 
 	w.tasksLocker.Lock()
 	w.tasks[tId] = localTask{
@@ -355,9 +413,6 @@ func (w *Worker) KillTask(t Task, reply *int) error {
 		_ = task.cmd.Process.Kill()
 		_ = task.input.Close()
 		_ = task.output.Close()
-		go func(cmd *exec.Cmd) {
-			_ = cmd.Wait()
-		}(task.cmd)
 		delete(w.tasks, id)
 	}
 	return nil
