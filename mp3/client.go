@@ -208,41 +208,20 @@ func (c *Client) client() {
 
 func (c *Client) addContentAtNodes(localName string, remoteName string, numNodesWanted int, addType string) error {
 	if _, err := os.Stat(localName); err == nil {
-		// file exists locally
-		c.appendNumbersMutex.Lock()
-		defer c.appendNumbersMutex.Unlock()
-		nodes, err := c.getReplicaNodes(remoteName)
+		localFileContent, err := os.ReadFile(localName)
 		if err != nil {
 			return err
 		}
-		localFileContent, _ := os.ReadFile(localName)
-		serversCalled := 0
-		waitChan := make(chan *rpc.Call, numNodesWanted)
-		replies := make([]resources.AddFileReply, numNodesWanted)
-		randNum := rand.Intn(len(nodes))
-		for i := 0; i < numNodesWanted; i++ {
-			curNode := nodes[(randNum+i)%len(nodes)]
-			args := resources.AddFileArgs{
-				HDFSFileName: remoteName,
-				Content:      localFileContent,
-				AppendNumber: resources.AppendNumber{
-					NodeId:  c.myNode,
-					Counter: c.appendNumber,
-				},
-			}
 
-			curServer, err := rpc.Dial("tcp", curNode.IP()+":8010")
-			if err == nil {
-				curServer.Go(fmt.Sprintf("Server.%s", addType), &args, &replies[i], waitChan)
-				serversCalled++
-			}
+		// Call the new helper
+		replies, err := c.sendDataToNodes(remoteName, localFileContent, numNodesWanted, addType)
+		if err != nil {
+			return err
 		}
 
-		for i := 0; i < serversCalled; i++ {
-			l := <-waitChan
-			err := l.Reply.(*resources.AddFileReply).Err
-			if err != nil {
-				//error
+		// Restore CLI behavior: Print errors if any replica failed
+		for _, reply := range replies {
+			if reply.Err != nil {
 				var existsErr *resources.FileAlreadyExistsError
 				var notFoundErr *resources.FileNotFoundError
 				switch {
@@ -254,11 +233,9 @@ func (c *Client) addContentAtNodes(localName string, remoteName string, numNodes
 				}
 			}
 		}
-		c.appendNumber++
 
 		return nil
 	} else {
-		//file does not exist locally
 		return err
 	}
 }
@@ -341,5 +318,78 @@ func (c *Client) MultiAppend(args resources.MultiAppendArgs, reply *int) error {
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+// sendDataToNodes performs the actual network operations with the server using raw bytes
+func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWanted int, addType string) ([]resources.AddFileReply, error) {
+	c.appendNumbersMutex.Lock()
+	defer c.appendNumbersMutex.Unlock()
+
+	// 1. Ask Coordinator for replica locations
+	nodes, err := c.getReplicaNodes(remoteName)
+	if err != nil {
+		return nil, err
+	}
+
+	serversCalled := 0
+	waitChan := make(chan *rpc.Call, numNodesWanted)
+
+	// We create the slice here to hold the responses
+	replies := make([]resources.AddFileReply, numNodesWanted)
+
+	randNum := rand.Intn(len(nodes))
+
+	// 2. Send to DataNodes
+	for i := 0; i < numNodesWanted; i++ {
+		curNode := nodes[(randNum+i)%len(nodes)]
+
+		args := resources.AddFileArgs{
+			HDFSFileName: remoteName,
+			Content:      content,
+			AppendNumber: resources.AppendNumber{
+				NodeId:  c.myNode,
+				Counter: c.appendNumber,
+			},
+		}
+
+		curServer, err := rpc.Dial("tcp", curNode.IP()+":8010")
+		if err == nil {
+			// We pass &replies[i] so the RPC fills that specific slot
+			curServer.Go(fmt.Sprintf("Server.%s", addType), &args, &replies[i], waitChan)
+			serversCalled++
+		}
+	}
+
+	// 3. Wait for all calls to finish
+	// We don't strictly need to read the errors here since we are returning the whole slice,
+	// but we must wait for the calls to complete.
+	for i := 0; i < serversCalled; i++ {
+		<-waitChan
+	}
+
+	c.appendNumber++
+
+	// Return the populated slice of replies
+	return replies, nil
+}
+
+// RemoteAppend is used to append to a file from a remote client
+func (c *Client) RemoteAppend(args *resources.RemoteFileArgs, reply *[]resources.AddFileReply) error {
+	responses, err := c.sendDataToNodes(args.RemoteName, args.Content, 2, appendRpc)
+	if err != nil {
+		return err
+	}
+	*reply = responses
+	return nil
+}
+
+// RemoteCreate is used to create a file from a remote client
+func (c *Client) RemoteCreate(args *resources.RemoteFileArgs, reply *[]resources.AddFileReply) error {
+	responses, err := c.sendDataToNodes(args.RemoteName, args.Content, 3, createRpc)
+	if err != nil {
+		return err
+	}
+	*reply = responses
 	return nil
 }

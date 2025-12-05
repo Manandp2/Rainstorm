@@ -91,3 +91,9 @@ type SendFileArgs struct {
 	DiskContent   []byte
 	BufferContent []AppendBlock
 }
+
+// RemoteFileArgs is used to send an append or create call to the server
+type RemoteFileArgs struct {
+	RemoteName string
+	Content    []byte
+}
