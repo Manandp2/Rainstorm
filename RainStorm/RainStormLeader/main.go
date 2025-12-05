@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type WorkerIps struct {
@@ -210,13 +211,16 @@ func (app *RainStorm) sendIps() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> on
 }
 
 func (app *RainStorm) initWorker() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> only called when current app is modified
-	//@TODO: add send some starting time
 	waitingChan := make(chan *rpc.Call, len(rpcWorkers))
 	numSuccess := 0
 	rpcWorkersLock.RLock()
+	args := InitArgs{
+		Ops:  app.Ops,
+		Time: time.Now(),
+	}
 	for _, worker := range rpcWorkers {
 		var reply int
-		worker.Go("Worker.Initialize", app.Ops, &reply, waitingChan)
+		worker.Go("Worker.Initialize", args, &reply, waitingChan)
 		numSuccess++
 	}
 	rpcWorkersLock.RUnlock()

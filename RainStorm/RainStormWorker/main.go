@@ -306,9 +306,9 @@ func (w *Worker) AutoscaleDown(t taskID, reply *int) error {
 	return nil
 }
 
-func (w *Worker) Initialize(stageOps []Operation, reply *int) error {
-	w.stageOperations = stageOps
-	// TODO: get starting time of rainstorm task, use time.Format("20060102150405")
+func (w *Worker) Initialize(args InitArgs, reply *int) error {
+	w.stageOperations = args.Ops
+	w.rainStormStartTime = args.Time.Format("20060102150405")
 	return nil
 }
 

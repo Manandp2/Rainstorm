@@ -1,5 +1,7 @@
 package resources
 
+import "time"
+
 const IntroducePort = ":8020"
 const AssignmentPort = ":8021"
 const TuplePort = ":8022"
@@ -29,4 +31,9 @@ type RmUpdate struct {
 	Stage int
 	Rate  int
 	Task  int
+}
+
+type InitArgs struct {
+	Ops  []Operation
+	Time time.Time
 }
