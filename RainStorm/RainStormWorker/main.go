@@ -41,6 +41,7 @@ type Worker struct {
 	rainStormLeader    *rpc.Client // used to send task completions
 	rainStormStartTime string
 	hydfsClient        *rpc.Client
+	hydfsDestFile      string
 
 	done        chan bool
 	tasksLocker sync.Mutex
@@ -192,7 +193,12 @@ func main() {
 						worker.taskOutputs <- out // didn't receive the ack, just try again
 					}
 				} else { // output data to the distributed file system
-					// TODO: Write to HyDFS
+					var r resources.AppendReply
+					worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+						RemoteName: worker.hydfsDestFile,
+						Content:    []byte(out.output),
+					}, &r, nil)
+					fmt.Println(out.output)
 				}
 			}
 		}()
@@ -309,6 +315,7 @@ func (w *Worker) AutoscaleDown(t taskID, reply *int) error {
 func (w *Worker) Initialize(args InitArgs, reply *int) error {
 	w.stageOperations = args.Ops
 	w.rainStormStartTime = args.Time.Format("20060102150405")
+	w.hydfsDestFile = args.HyDFSDestFile
 	return nil
 }
 

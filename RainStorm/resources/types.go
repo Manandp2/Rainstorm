@@ -34,6 +34,7 @@ type RmUpdate struct {
 }
 
 type InitArgs struct {
-	Ops  []Operation
-	Time time.Time
+	Ops           []Operation
+	Time          time.Time
+	HyDFSDestFile string
 }

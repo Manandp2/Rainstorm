@@ -215,8 +215,9 @@ func (app *RainStorm) initWorker() { // MUST BE CALLED INSIDE RAINSTORM LOCK -->
 	numSuccess := 0
 	rpcWorkersLock.RLock()
 	args := InitArgs{
-		Ops:  app.Ops,
-		Time: time.Now(),
+		Ops:           app.Ops,
+		Time:          time.Now(),
+		HyDFSDestFile: app.HydfsDestinationFileName,
 	}
 	for _, worker := range rpcWorkers {
 		var reply int
