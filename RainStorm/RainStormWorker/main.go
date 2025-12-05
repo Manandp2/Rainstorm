@@ -380,6 +380,8 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			var reply int
 			_ = w.rainStormLeader.Call("RainStorm.ReceiveTaskCompletion", t, &reply)
 		} else {
+			var reply int
+			_ = w.rainStormLeader.Call("RainStorm.ReceiveFailure", t, &reply)
 			fmt.Printf("Task %v failed: %v\n", t, err)
 		}
 		w.tasksLocker.Lock()
