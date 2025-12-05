@@ -44,7 +44,7 @@ type Worker struct {
 	hydfsDestFile      string
 
 	done        chan bool
-	tasksLocker sync.Mutex
+	tasksLocker sync.RWMutex
 	tasks       map[taskID]localTask
 
 	ips           []map[int]net.IP // ips of machines with [stage][task] indexing
@@ -250,9 +250,9 @@ func main() {
 
 						// write to task
 						targetTask := taskID{stage: stage, task: task}
-						worker.tasksLocker.Lock()
+						worker.tasksLocker.RLock()
 						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
-						worker.tasksLocker.Unlock()
+						worker.tasksLocker.RUnlock()
 						if err != nil {
 							continue // we weren't able to write, so no ack
 						}
@@ -295,8 +295,8 @@ func getOutboundIP() net.IP {
 }
 
 func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
-	w.tasksLocker.Lock()
-	defer w.tasksLocker.Unlock()
+	w.tasksLocker.RLock()
+	defer w.tasksLocker.RUnlock()
 	for key, value := range w.tasks {
 		if key.stage == stage+1 {
 			_ = value.input.Close()
@@ -306,8 +306,8 @@ func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 }
 
 func (w *Worker) AutoscaleDown(t taskID, reply *int) error {
-	w.tasksLocker.Lock()
-	defer w.tasksLocker.Unlock()
+	w.tasksLocker.RLock()
+	defer w.tasksLocker.RUnlock()
 	_ = w.tasks[t].input.Close()
 	return nil
 }
@@ -382,6 +382,9 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		} else {
 			fmt.Printf("Task %v failed: %v\n", t, err)
 		}
+		w.tasksLocker.Lock()
+		delete(w.tasks, t)
+		w.tasksLocker.Unlock()
 	}(taskStdout, tId, w.taskOutputs, task)
 
 	// Add the task to the map
