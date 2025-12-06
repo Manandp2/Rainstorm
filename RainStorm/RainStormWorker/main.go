@@ -88,6 +88,7 @@ func main() {
 		return
 	}
 	for {
+		println("beginning of loop ")
 		server := rpc.NewServer()
 		rainStormLeader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+GlobalRMPort)
 		if err != nil {
@@ -112,6 +113,7 @@ func main() {
 			continue
 		}
 		go server.Accept(leaderListener)
+		println("got to after making server")
 
 		// Goroutine for sending out tuples
 		go func() {
