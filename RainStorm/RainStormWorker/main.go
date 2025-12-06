@@ -332,11 +332,16 @@ func getOutboundIP() net.IP {
 
 func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 	w.tasksLocker.RLock()
-	defer w.tasksLocker.RUnlock()
+	var inputsToClose []io.WriteCloser
 	for key, value := range w.tasks {
 		if key.stage == stage+1 {
-			_ = value.input.Close()
+			inputsToClose = append(inputsToClose, value.input)
 		}
+	}
+	w.tasksLocker.RUnlock()
+
+	for _, input := range inputsToClose {
+		_ = input.Close()
 	}
 	return nil
 }
@@ -464,31 +469,31 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 
 		// Mark all processed tuples
 		w.tuplesLock.Lock()
-		tuples := make(map[string]bool)
+		tuples := make(map[string]string)      // Key=ID, Value=tuple
+		tupleStatus := make(map[string]string) // Key=ID, Value="RECEIVED" or "PROCESSED"
 		for scanner.Scan() {
 			splits := strings.SplitN(scanner.Text(), ",", 3)
 			if len(splits) != 3 {
 				continue
 			}
-			w.receivedTuples[splits[1]] = true
-			_, exists := tuples[splits[2]]
-			if exists && splits[0] == "PROCESSED" {
-				tuples[splits[2]] = true
-			} else if !exists && splits[0] == "RECEIVED" {
-				tuples[splits[2]] = false
-			} else {
-				fmt.Println("This should not have happened, Error processing file ", splits[1])
+			id := splits[1]
+			w.receivedTuples[id] = true
+			if splits[0] == "PROCESSED" {
+				tupleStatus[id] = "PROCESSED"
+			} else if splits[0] == "RECEIVED" {
+				if _, exists := tupleStatus[id]; !exists {
+					tupleStatus[id] = "RECEIVED"
+					tuples[id] = splits[2]
+				}
 			}
 		}
 		w.tuplesLock.Unlock()
 
 		// Add all unmarked tuples
-		for tuple, processed := range tuples {
-			if !processed {
-				_, err = io.WriteString(taskStdin, tuple+"\n")
-				if err != nil {
-					fmt.Println("Error writing tuple to task ", tuple, err)
-				}
+		for _, tuple := range tuples {
+			_, err = io.WriteString(taskStdin, tuple+"\n")
+			if err != nil {
+				fmt.Println("Error writing tuple to task ", tuple, err)
 			}
 		}
 	}
@@ -505,7 +510,6 @@ func (w *Worker) KillTask(t Task, reply *int) error {
 		_ = task.cmd.Process.Kill()
 		_ = task.input.Close()
 		_ = task.output.Close()
-		delete(w.tasks, id)
 	}
 	return nil
 }
