@@ -76,7 +76,7 @@ func main() {
 		return
 	}
 	var reply int
-	err = leader.Call("WorkerIps.AddWorker", getOutboundIP(), &reply)
+	err = leader.Call("WorkerIps.AddWorkers", getOutboundIP(), &reply)
 	if err != nil {
 		fmt.Println(err)
 		return
