@@ -60,6 +60,7 @@ type Worker struct {
 	connectionsLock sync.RWMutex
 	stageOperations []Operation
 
+	tuplesLock     sync.Mutex
 	receivedTuples map[string]bool // key = taskId-TupleId, value is dummy
 }
 
@@ -123,7 +124,7 @@ func main() {
 				var r resources.AppendReply
 				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.stage, out.taskId.task),
-					Content:    []byte(fmt.Sprintf("PROCESSED-%s", out.output)),
+					Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s", out.taskId.String(), out.tupleId, out.output)),
 				}, &r, nil)
 				if nextStage < len(worker.ips) { // send it to the next stage
 					key := out.output
@@ -233,6 +234,7 @@ func main() {
 						split := strings.SplitN(tuple, ",", 4)
 
 						// De-duplication
+						worker.tuplesLock.Lock()
 						if _, ok := worker.receivedTuples[split[0]]; ok {
 							// We have already received this tuple, send an ack back
 							ackMsg := fmt.Sprintf("%s-%s\n", split[0], ACK)
@@ -241,6 +243,7 @@ func main() {
 						} else {
 							worker.receivedTuples[split[0]] = true
 						}
+						worker.tuplesLock.Unlock()
 
 						// find the correct task
 						stage, err := strconv.Atoi(split[1])
@@ -265,6 +268,7 @@ func main() {
 							continue // we weren't able to write, so no ack
 						}
 						// send the ack
+						_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 						ackMsg := fmt.Sprintf("%s-%s\n", split[0], ACK)
 						_, err = fmt.Fprintf(conn, ackMsg)
 						if err != nil {
@@ -273,7 +277,7 @@ func main() {
 						var r resources.AppendReply
 						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 							RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
-							Content:    []byte(fmt.Sprintf("RECEIVED-%s", split[3])),
+							Content:    []byte(fmt.Sprintf("RECEIVED,%s,%s", split[0], split[3])),
 						}, &r, nil)
 					}
 				}(conn)
@@ -459,21 +463,24 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		scanner := bufio.NewScanner(bytes.NewReader(contents))
 
 		// Mark all processed tuples
+		w.tuplesLock.Lock()
 		tuples := make(map[string]bool)
 		for scanner.Scan() {
-			splits := strings.SplitN(scanner.Text(), "-", 2)
-			if len(splits) != 2 {
+			splits := strings.SplitN(scanner.Text(), ",", 3)
+			if len(splits) != 3 {
 				continue
 			}
-			_, exists := tuples[splits[1]]
+			w.receivedTuples[splits[1]] = true
+			_, exists := tuples[splits[2]]
 			if exists && splits[0] == "PROCESSED" {
-				tuples[splits[1]] = true
+				tuples[splits[2]] = true
 			} else if !exists && splits[0] == "RECEIVED" {
-				tuples[splits[1]] = false
+				tuples[splits[2]] = false
 			} else {
 				fmt.Println("This should not have happened, Error processing file ", splits[1])
 			}
 		}
+		w.tuplesLock.Unlock()
 
 		// Add all unmarked tuples
 		for tuple, processed := range tuples {
