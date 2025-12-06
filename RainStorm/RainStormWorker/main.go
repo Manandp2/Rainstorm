@@ -20,11 +20,13 @@ import (
 )
 
 type localTask struct {
-	cmd       *exec.Cmd
-	input     io.WriteCloser // To send tuples to tasks (receives data from tcp)
-	output    io.ReadCloser  // To send tuples to the next stage (sends data through tcp)
-	inputRate int
-	startTime time.Time
+	cmd            *exec.Cmd
+	input          io.WriteCloser // To send tuples to tasks (receives data from tcp)
+	output         io.ReadCloser  // To send tuples to the next stage (sends data through tcp)
+	inputRate      int
+	startTime      time.Time
+	lastCheckTime  time.Time
+	lastInputCount int
 }
 type taskID struct {
 	stage int
@@ -201,7 +203,7 @@ func main() {
 					var r resources.AppendReply
 					worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 						RemoteName: worker.hydfsDestFile,
-						Content:    []byte(out.output),
+						Content:    []byte(out.output + "\n"),
 					}, &r, nil)
 					fmt.Println(out.output)
 				}
@@ -257,13 +259,13 @@ func main() {
 
 						// write to task
 						targetTask := taskID{stage: stage, task: task}
-						worker.tasksLocker.RLock()
+						worker.tasksLocker.Lock()
 						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
 						if worker.tasks[targetTask].inputRate == 0 {
 							worker.tasks[targetTask].startTime = time.Now()
 						}
 						worker.tasks[targetTask].inputRate++
-						worker.tasksLocker.RUnlock()
+						worker.tasksLocker.Unlock()
 						if err != nil {
 							continue // we weren't able to write, so no ack
 						}
@@ -286,21 +288,46 @@ func main() {
 
 		// Local Resource Manager
 		go func() {
-			ticker := time.Tick(3 * time.Second)
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+
 			for {
-				<-ticker
+				<-ticker.C
 				worker.tasksLocker.RLock()
 				for t, task := range worker.tasks {
-					duration := time.Now().Sub(task.startTime).Seconds()
+
+					if task.startTime.IsZero() {
+						continue
+					}
+
+					// If this is the first check, snapshot the current state and wait for the next tick
+					if task.lastCheckTime.IsZero() {
+						task.lastCheckTime = time.Now()
+						task.lastInputCount = task.inputRate
+						continue
+					}
+
+					// (Current Total - Old Total) / (Now - Old Time)
+					now := time.Now()
+					duration := now.Sub(task.lastCheckTime).Seconds()
+
 					if duration > 0 {
-						rate := float64(task.inputRate) / duration
+						// Calculate tuples per second over the last window
+						tuplesReceivedSinceLastTick := float64(task.inputRate - task.lastInputCount)
+						rate := tuplesReceivedSinceLastTick / duration
+
+						// Update snapshot for the next tick
+						task.lastCheckTime = now
+						task.lastInputCount = task.inputRate
+
+						// Check Watermarks
 						if rate < worker.lowWatermark || rate > worker.highWatermark {
 							var r int
-							_ = worker.rainStormLeader.Call("RainStorm.ReceiveRateUpdate", RmUpdate{
+							worker.rainStormLeader.Go("RainStorm.ReceiveRateUpdate", RmUpdate{
 								Stage: t.stage,
 								Rate:  rate,
 								Task:  t.task,
-							}, &r)
+							}, &r, nil)
 						}
 					}
 				}
