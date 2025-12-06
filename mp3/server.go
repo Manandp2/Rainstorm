@@ -267,14 +267,14 @@ func (s *Server) Append(args *resources.AppendArgs, reply *resources.AppendReply
 	s.filesLock.RLock()
 	f, exists := s.files[args.HDFSFileName]
 	s.filesLock.RUnlock()
-	f.lock.Lock()
-	fmt.Println("Server: Start Append " + args.HDFSFileName)
-	defer f.lock.Unlock()
 	if !exists {
 		reply.Err = &resources.FileNotFoundError{FileName: args.HDFSFileName}
 		fmt.Println("Sever: Error Append " + reply.Err.Error())
 		return nil
 	}
+	f.lock.Lock()
+	fmt.Println("Server: Start Append " + args.HDFSFileName)
+	defer f.lock.Unlock()
 	file := &f.file
 	// find where to insert, order is first based on the NodeId, and then within a NodeId, by appendNumber
 	// predecessor will be the element we insert AFTER.
