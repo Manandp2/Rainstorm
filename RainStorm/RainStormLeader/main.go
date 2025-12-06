@@ -32,12 +32,14 @@ type RainStorm struct {
 	LowestRate               float64
 	HighestRate              float64
 	Ops                      []Operation
-	Ips                      []map[int]net.IP // [stage][task] --> IP
-	NextTaskNum              []int            // [stage]
+	TaskInformation          []map[int]*TaskInfo // [stage][task] --> IP
+	NextTaskNum              []int               // [stage]
 	NextAvailableVM          int
 	Stage1UpdatesChan        chan map[int]net.IP
-	Lock                     *sync.Mutex
+	Lock                     *sync.RWMutex
 	DoneReading              bool
+	StartTime                time.Time
+	LogFile                  *os.File
 }
 
 const clientTimeout = time.Second * 3
@@ -101,7 +103,20 @@ func main() {
 			fmt.Println("GlobalRM unable to connect to worker: " + err.Error())
 			continue
 		}
-		go appServer.Accept(globalRmListener)
+		go func() {
+			for {
+				conn, err := globalRmListener.Accept()
+				if err != nil {
+					if strings.Contains(err.Error(), "use of closed network connection") {
+						return // Exit quietly
+					}
+					fmt.Println("GlobalRM Accept error: " + err.Error())
+					return
+				}
+				//give connection to RPC server
+				go appServer.ServeConn(conn)
+			}
+		}()
 
 		workers.l.RLock()
 		rpcWorkers = make(map[string]*rpc.Client)
@@ -120,9 +135,13 @@ func main() {
 		workers.l.RUnlock()
 		rpcWorkersLock.Unlock()
 
-		r.Lock = new(sync.Mutex)
+		r.Lock = new(sync.RWMutex)
 		r.Lock.Lock()
-		r.Ips = make([]map[int]net.IP, r.NumStages)
+		r.StartTime = time.Now()
+		path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.String())
+		r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		_, _ = r.LogFile.WriteString("Started RainStorm Application\n")
+		r.TaskInformation = make([]map[int]*TaskInfo, r.NumStages)
 		r.NextTaskNum = make([]int, r.NumStages)
 		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
 		r.DoneReading = false
@@ -130,13 +149,14 @@ func main() {
 		r.initWorker()
 		r.NextAvailableVM = 0
 		for i := range r.NumStages {
-			r.Ips[i] = make(map[int]net.IP)
+			r.TaskInformation[i] = make(map[int]*TaskInfo)
 			//r.TaskCompletion[i] = CompletionTuple{
 			//	Counter:      0,
 			//	StateTracker: make(map[int]bool),
 			//}
-			for range r.NumTasksPerStage {
-				r.addTask(i)
+			for j := range r.NumTasksPerStage {
+				r.addTask(i, j)
+				r.NextTaskNum[i]++
 			}
 		}
 		r.sendIps()
@@ -164,8 +184,8 @@ func main() {
 			r.Lock.Lock()
 			firstStageTasks := make(map[int]net.IP)
 			firstTaskList := make([]int, 0)
-			for tid, ip := range r.Ips[0] {
-				firstStageTasks[tid] = ip
+			for tid, info := range r.TaskInformation[0] {
+				firstStageTasks[tid] = info.Ip
 				firstTaskList = append(firstTaskList, tid)
 			}
 			sort.Ints(firstTaskList)
@@ -194,73 +214,137 @@ func main() {
 				r.DoneReading = true
 				r.Lock.Unlock()
 			}()
+			eofReceived := false
+			done := false
 			for {
-				tuple := <-readingChan
-				if tuple.lineNum == -1 {
-					//done reading
-					break
-				}
 				select {
-				case updatedMap := <-r.Stage1UpdatesChan:
-					firstStageTasks = updatedMap
-					firstTaskList = make([]int, 0)
-					for k := range firstStageTasks {
-						firstTaskList = append(firstTaskList, k)
-					}
-					sort.Ints(firstTaskList)
-				default:
-				}
-
-				nextTask := firstTaskList[tuple.lineNum%len(firstTaskList)]
-				nextTaskIp := firstStageTasks[nextTask]
-
-				client, ok := tupleClients[nextTaskIp.String()]
-				if !ok {
-					conn, err := net.Dial("tcp", nextTaskIp.String()+TuplePort)
-					if err != nil {
-						fmt.Println("Unable to connect to worker: " + err.Error())
-						delete(tupleClients, nextTaskIp.String())
+				case tuple := <-readingChan:
+					if tuple.lineNum == -1 {
+						//done reading
+						eofReceived = true
 						continue
 					}
-					client = &WorkerClient{
-						Conn: conn,
-						Buf:  bufio.NewReader(conn),
+					select {
+					case updatedMap := <-r.Stage1UpdatesChan:
+						firstStageTasks = updatedMap
+						firstTaskList = make([]int, 0)
+						for k := range firstStageTasks {
+							firstTaskList = append(firstTaskList, k)
+						}
+						sort.Ints(firstTaskList)
+					default:
 					}
-					tupleClients[nextTaskIp.String()] = client
+
+					nextTask := firstTaskList[tuple.lineNum%len(firstTaskList)]
+					nextTaskIp := firstStageTasks[nextTask]
+
+					client, ok := tupleClients[nextTaskIp.String()]
+					if !ok {
+						conn, err := net.Dial("tcp", nextTaskIp.String()+TuplePort)
+						if err != nil {
+							fmt.Println("Unable to connect to worker: " + err.Error())
+							delete(tupleClients, nextTaskIp.String())
+							continue
+						}
+						client = &WorkerClient{
+							Conn: conn,
+							Buf:  bufio.NewReader(conn),
+						}
+						tupleClients[nextTaskIp.String()] = client
+					}
+
+					// Send the tuple
+					_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
+					// Id-Id, stage, task, data
+					_, _ = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", "temp", tuple.lineNum, 0, nextTask, tuple.line)
+
+					// Wait for the ack
+					_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
+					ack, err := client.Buf.ReadString('\n')
+					expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
+					if err != nil || strings.TrimSpace(ack) != expectedAck {
+						client.Conn.Close()
+						delete(tupleClients, nextTaskIp.String())
+						readingChan <- tuple
+						continue
+					}
+
+					expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
+					targetTime := startTime.Add(expectedDuration)
+
+					now := time.Now()
+					if targetTime.After(now) {
+						// ahead of schedule, sleep to sync with desired rate
+						time.Sleep(targetTime.Sub(now))
+					}
+				default:
+					// reached if channel is empty
+					if eofReceived {
+						done = true
+					}
 				}
-
-				// Send the tuple
-				_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
-				// Id-Id, stage, task, data
-				_, _ = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", "temp", tuple.lineNum, 0, nextTask, tuple.line)
-
-				// Wait for the ack
-				_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
-				ack, err := client.Buf.ReadString('\n')
-				expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
-				if err != nil || strings.TrimSpace(ack) != expectedAck {
-					client.Conn.Close()
-					delete(tupleClients, nextTaskIp.String())
-					readingChan <- tuple
-					continue
-				}
-
-				expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
-				targetTime := startTime.Add(expectedDuration)
-
-				now := time.Now()
-				if targetTime.After(now) {
-					// ahead of schedule, sleep to sync with desired rate
-					time.Sleep(targetTime.Sub(now))
+				if done {
+					break
 				}
 			}
+
 			r.sendStageCompletion(-1)
+			for _, c := range tupleClients {
+				c.Conn.Close()
+			}
+			println("done closing conns")
 			_ = inputFile.Close()
+		}()
+
+		readingChan := make(chan string, 200)
+		go func() {
+			buffer := make([]byte, 4096)
+			for {
+				line := <-readingChan
+				buffer = append(buffer, []byte(line)...)
+				var reply []resources.AppendReply
+				_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
+					RemoteName: r.HydfsDestinationFileName,
+					Content:    buffer,
+				}, &reply)
+			}
+		}()
+		//listen for tuples to print to console and buffered append to hydfs
+		go func() {
+			tupleListener, err := net.Listen("tcp", TuplePort)
+			if err != nil {
+				return
+			}
+			defer func(tupleListener net.Listener) {
+				_ = tupleListener.Close()
+			}(tupleListener)
+
+			for {
+				conn, err := tupleListener.Accept()
+				if err != nil {
+					continue
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					reader := bufio.NewReader(conn)
+					for {
+						line, err := reader.ReadString('\n')
+						if err != nil {
+							return // connection closed/failed
+						}
+						fmt.Println(line)
+						readingChan <- line
+					}
+				}(conn)
+			}
 		}()
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
 		<-appCompletedChan //blocking
 		println("RainStorm Application completed!")
-
+		r.Lock.Lock()
+		_, _ = r.LogFile.WriteString("Finsihed Rainstorm Application\n")
+		_ = r.LogFile.Close()
+		r.Lock.Unlock()
 		// CLEANUP: do once the current RainStorm application is done
 		// @TODO: add cleanup for client connections when sending tuples
 		rpcWorkersLock.Lock()
@@ -289,35 +373,42 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 	// restart the task on the next worker in the cycle
 	app.Lock.Lock()
 	defer app.Lock.Unlock()
-	if _, exists := app.Ips[task.Stage][task.TaskNumber]; !exists {
+	if _, exists := app.TaskInformation[task.Stage][task.TaskNumber]; !exists {
 		fmt.Printf("Failing task:%d at stage: %d does not exist", task.TaskNumber, task.Stage)
 	} else {
 		workers.l.RLock()
-		app.Ips[task.Stage][task.TaskNumber] = workers.ips[app.NextAvailableVM%numWorkers]
+		app.TaskInformation[task.Stage][task.TaskNumber].Ip = workers.ips[app.NextAvailableVM%numWorkers]
 		workers.l.RUnlock()
 		app.NextAvailableVM++
 		if task.Stage == 0 && !app.DoneReading {
 			temp := make(map[int]net.IP)
-			for t, ip := range app.Ips[0] {
-				temp[t] = ip
+			for t, ip := range app.TaskInformation[0] {
+				temp[t] = ip.Ip
 			}
 			app.Stage1UpdatesChan <- temp
 		}
+		app.addTask(task.Stage, task.TaskNumber)
 		app.sendIps()
 	}
 	return nil
 }
 func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
-	app.Lock.Lock()
-	defer app.Lock.Unlock()
+	//@TODO: write to leader logs wheen receiving a tuple rate
+	//app.LogFile
 	if app.AutoScale {
 		if args.Rate < app.LowestRate {
 			//	add a task to this stage
-			app.addTask(args.Stage)
+			app.Lock.Lock()
+			taskNum := app.NextTaskNum[args.Stage]
+			app.NextTaskNum[args.Stage]++
+			app.addTask(args.Stage, taskNum)
 			app.sendIps()
+			app.Lock.Unlock()
 		} else if args.Rate > app.HighestRate {
 			//	remove a task from this stage
+			app.Lock.Lock()
 			app.removeTask(args.Stage)
+			app.Lock.Unlock()
 		}
 	}
 	return nil
@@ -327,11 +418,11 @@ func (app *RainStorm) ReceiveTaskCompletion(args TaskID, reply *int) error {
 	//stage completion manager --> manage markers from tasks saying they are done
 	app.Lock.Lock()
 	defer app.Lock.Unlock()
-	if _, exists := app.Ips[args.Stage][args.Task]; exists {
-		delete(app.Ips[args.Stage], args.Task)
+	if _, exists := app.TaskInformation[args.Stage][args.Task]; exists {
+		delete(app.TaskInformation[args.Stage], args.Task)
 		//app.CurNumTasks[args.Stage] -= 1
 		app.sendIps()
-		if len(app.Ips[args.Stage]) == 0 {
+		if len(app.TaskInformation[args.Stage]) == 0 {
 			// stage completed
 			app.sendStageCompletion(args.Stage)
 			if args.Stage+1 == app.NumStages {
@@ -370,7 +461,7 @@ func (app *RainStorm) sendIps() { // MUST BE CALLED INSIDE RAINSTORM LOCK --> on
 	rpcWorkersLock.RLock()
 	for _, worker := range rpcWorkers {
 		var reply int
-		worker.Go("Worker.ReceiveIPs", app.Ips, &reply, waitingChan)
+		worker.Go("Worker.ReceiveIPs", app.TaskInformation, &reply, waitingChan)
 		numSuccess++
 	}
 	rpcWorkersLock.RUnlock()
@@ -388,7 +479,7 @@ func (app *RainStorm) initWorker() { // MUST BE CALLED INSIDE RAINSTORM LOCK -->
 	rpcWorkersLock.RLock()
 	args := InitArgs{
 		Ops:           app.Ops,
-		Time:          time.Now(),
+		Time:          app.StartTime,
 		HyDFSDestFile: app.HydfsDestinationFileName,
 		LowWatermark:  app.LowestRate,
 		HighWatermark: app.HighestRate,
@@ -407,23 +498,22 @@ func (app *RainStorm) initWorker() { // MUST BE CALLED INSIDE RAINSTORM LOCK -->
 	}
 }
 
-func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CALLED
+func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN LOCK WHEN CALLED
 	//if taskNum > app.StageCounter[stageNum]) {
-	//	app.Ips[stageNum] = append(app.Ips[stageNum], workers.ips[app.NextAvailableVM%numWorkers])
+	//	app.TaskInformation[stageNum] = append(app.TaskInformation[stageNum], workers.ips[app.NextAvailableVM%numWorkers])
 	//} else {
-	//	app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
+	//	app.TaskInformation[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
 	//}
-	taskNum := app.NextTaskNum[stageNum]
 	workers.l.RLock()
-	app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
+	app.TaskInformation[stageNum][taskNum] = TaskInfo{Ip: workers.ips[app.NextAvailableVM%numWorkers]}
 	workers.l.RUnlock()
 	//app.TaskCompletion[stageNum].StateTracker[taskNum] = false
-	app.NextTaskNum[stageNum]++
+	//app.NextTaskNum[stageNum]++
 	app.NextAvailableVM++
 	if stageNum == 0 && !app.DoneReading {
 		temp := make(map[int]net.IP)
-		for task, ip := range app.Ips[0] {
-			temp[task] = ip
+		for task, ip := range app.TaskInformation[0] {
+			temp[task] = ip.Ip
 		}
 		app.Stage1UpdatesChan <- temp
 	}
@@ -435,35 +525,36 @@ func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CAL
 
 	var reply int
 	rpcWorkersLock.RLock()
-	rpcWorker := rpcWorkers[app.Ips[stageNum][taskNum].String()]
+	rpcWorker := rpcWorkers[app.TaskInformation[stageNum][taskNum].Ip.String()]
 	rpcWorkersLock.RUnlock()
 	err := rpcWorker.Call("Worker.AddTask", task, &reply)
 	if err != nil {
 		fmt.Println("Failed to send request to add task: " + err.Error())
 	}
+	app.TaskInformation[stageNum][taskNum].Pid = reply
 }
 
 func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
-	if len(app.Ips[stageNum]) <= 1 { // only 1 task remaining in the stage
+	if len(app.TaskInformation[stageNum]) <= 1 { // only 1 task remaining in the stage
 		return
 	}
 	var taskNum int
-	for k := range app.Ips[stageNum] {
+	for k := range app.TaskInformation[stageNum] {
 		// getting first taskNum when iterating to remove
 		taskNum = k
 		break
 	}
 
-	deletedTaskIp, exists := app.Ips[stageNum][taskNum]
+	deletedTaskIp, exists := app.TaskInformation[stageNum][taskNum]
 	if !exists {
 		fmt.Printf("Failed to remove task: %d, stage %d: not exists", taskNum, stageNum)
 		return
 	}
 
-	delete(app.Ips[stageNum], taskNum)
+	delete(app.TaskInformation[stageNum], taskNum)
 	if stageNum == 0 && !app.DoneReading {
 		temp := make(map[int]net.IP)
-		for task, ip := range app.Ips[0] {
+		for task, ip := range app.TaskInformation[0] {
 			temp[task] = ip
 		}
 		app.Stage1UpdatesChan <- temp
