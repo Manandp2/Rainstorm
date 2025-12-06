@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,8 +34,11 @@ type RainStorm struct {
 	Ips                      []map[int]net.IP // [stage][task] --> IP
 	NextTaskNum              []int            // [stage]
 	NextAvailableVM          int
+	Stage1UpdatesChan        chan map[int]net.IP
 	Lock                     *sync.Mutex
 }
+
+const clientTimeout = time.Second * 3
 
 var workers WorkerIps
 var numWorkers int
@@ -41,10 +46,14 @@ var numSuccessfulDials int
 var rpcWorkers map[string]*rpc.Client
 var rpcWorkersLock sync.RWMutex
 var appCompletedChan chan bool
+var dataDir string
 
 func main() {
+	homeDir, _ := os.UserHomeDir()
+	dataDir = filepath.Join(homeDir, "data")
 	workers = WorkerIps{}
 	appCompletedChan = make(chan bool, 1)
+
 	go func() {
 		err := rpc.Register(&workers)
 		if err != nil {
@@ -89,6 +98,7 @@ func main() {
 		r.Lock.Lock()
 		r.Ips = make([]map[int]net.IP, r.NumStages)
 		r.NextTaskNum = make([]int, r.NumStages)
+		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
 		//r.TaskCompletion = make([]CompletionTuple, r.NumStages)
 		r.initWorker()
 		r.NextAvailableVM = 0
@@ -98,7 +108,7 @@ func main() {
 			//	Counter:      0,
 			//	StateTracker: make(map[int]bool),
 			//}
-			for _ = range r.NumTasksPerStage {
+			for range r.NumTasksPerStage {
 				r.addTask(i)
 			}
 		}
@@ -129,7 +139,102 @@ func main() {
 		//@TODO: read srcFile from HyDFS and send into system at Input Rate for this application
 		// send stage -1 is done once done reading from the file
 		// read in from local; output on HyDFS
+		inputFile, err := os.Open(filepath.Join(dataDir, r.HydfsSrcDirectory))
+		if err != nil {
+			fmt.Println("Unable to open src directory: " + err.Error())
+		}
 
+		go func() {
+			scanner := bufio.NewScanner(inputFile)
+			r.Lock.Lock()
+			firstStageTasks := make(map[int]net.IP)
+			firstTaskList := make([]int, 0)
+			for tid, ip := range r.Ips[0] {
+				firstStageTasks[tid] = ip
+				firstTaskList = append(firstTaskList, tid)
+			}
+			sort.Ints(firstTaskList)
+			r.Lock.Unlock()
+			tupleClients := make(map[string]*WorkerClient, numWorkers)
+			startTime := time.Now()
+			var numProcessed float64 = 0
+			readingChan := make(chan struct {
+				line    string
+				lineNum int
+			}, 100)
+			go func() {
+				lineNum := 0
+				for scanner.Scan() {
+					readingChan <- struct {
+						line    string
+						lineNum int
+					}{line: scanner.Text(), lineNum: lineNum}
+					lineNum++
+				}
+				readingChan <- struct {
+					line    string
+					lineNum int
+				}{line: "", lineNum: -1}
+			}()
+			for {
+				tuple := <-readingChan
+				if tuple.lineNum == -1 {
+					//done reading
+					break
+				}
+				select {
+				case updatedMap := <-r.Stage1UpdatesChan:
+					firstStageTasks = updatedMap
+					firstTaskList = make([]int, 0)
+					for k := range firstStageTasks {
+						firstTaskList = append(firstTaskList, k)
+					}
+					sort.Ints(firstTaskList)
+				default:
+				}
+
+				nextTask := firstTaskList[tuple.lineNum%len(firstTaskList)]
+				nextTaskIp := firstStageTasks[nextTask]
+
+				client, ok := tupleClients[nextTaskIp.String()]
+				if !ok {
+					conn, err := net.Dial("tcp", nextTaskIp.String()+TuplePort)
+					if err != nil {
+						fmt.Println("Unable to connect to worker: " + err.Error())
+						delete(tupleClients, nextTaskIp.String())
+						continue
+					}
+					newClient := &WorkerClient{
+						Conn: conn,
+						Buf:  bufio.NewReader(conn),
+					}
+					tupleClients[nextTaskIp.String()] = newClient
+				}
+
+				// Send the tuple
+				_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
+				// Id-Id, stage, task, data
+				_, _ = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", "temp", tuple.lineNum, 0, nextTask, tuple.line)
+
+				// Wait for the ack
+				_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
+				ack, err := client.Buf.ReadString('\n')
+				expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
+				if err != nil || strings.TrimSpace(ack) != expectedAck {
+					readingChan <- tuple
+				}
+
+				expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
+				targetTime := startTime.Add(expectedDuration)
+
+				now := time.Now()
+				if targetTime.After(now) {
+					// ahead of schedule, sleep to sync with desired rate
+					time.Sleep(targetTime.Sub(now))
+				}
+			}
+			_ = inputFile.Close()
+		}()
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
 		<-appCompletedChan //blocking
 		println("RainStorm Application completed!")
@@ -168,6 +273,13 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 		app.Ips[task.Stage][task.TaskNumber] = workers.ips[app.NextAvailableVM%numWorkers]
 		workers.l.RUnlock()
 		app.NextAvailableVM++
+		if task.Stage == 0 {
+			temp := make(map[int]net.IP)
+			for t, ip := range app.Ips[0] {
+				temp[t] = ip
+			}
+			app.Stage1UpdatesChan <- temp
+		}
 		app.sendIps()
 	}
 	return nil
@@ -286,6 +398,13 @@ func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CAL
 	//app.TaskCompletion[stageNum].StateTracker[taskNum] = false
 	app.NextTaskNum[stageNum]++
 	app.NextAvailableVM++
+	if stageNum == 0 {
+		temp := make(map[int]net.IP)
+		for task, ip := range app.Ips[0] {
+			temp[task] = ip
+		}
+		app.Stage1UpdatesChan <- temp
+	}
 	task := Task{
 		TaskNumber: taskNum,
 		Stage:      stageNum,
@@ -320,6 +439,13 @@ func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK W
 	}
 
 	delete(app.Ips[stageNum], taskNum)
+	if stageNum == 0 {
+		temp := make(map[int]net.IP)
+		for task, ip := range app.Ips[0] {
+			temp[task] = ip
+		}
+		app.Stage1UpdatesChan <- temp
+	}
 	app.sendIps()
 
 	task := Task{
