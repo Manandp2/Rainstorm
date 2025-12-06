@@ -28,18 +28,10 @@ type localTask struct {
 	lastCheckTime  time.Time
 	lastInputCount int
 }
-type taskID struct {
-	stage int
-	task  int
-}
-
-func (t *taskID) String() string {
-	return fmt.Sprintf("%d-%d", t.stage, t.task)
-}
 
 type taskOutput struct {
 	tupleId int
-	taskId  taskID
+	taskId  TaskID
 	output  string
 }
 type Worker struct {
@@ -52,7 +44,7 @@ type Worker struct {
 
 	done        chan bool
 	tasksLocker sync.RWMutex
-	tasks       map[taskID]*localTask
+	tasks       map[TaskID]*localTask
 
 	ips           []map[int]net.IP // ips of machines with [stage][task] indexing
 	taskIDLocker  sync.RWMutex
@@ -94,11 +86,12 @@ func main() {
 			continue // try again
 		}
 		worker := Worker{
-			hydfsClient: hydfsClient,
-			done:        make(chan bool),
-			tasks:       make(map[taskID]*localTask),
-			taskOutputs: make(chan taskOutput, 100),
-			connections: make(map[string]*WorkerClient),
+			hydfsClient:    hydfsClient,
+			done:           make(chan bool),
+			tasks:          make(map[TaskID]*localTask),
+			taskOutputs:    make(chan taskOutput, 100),
+			connections:    make(map[string]*WorkerClient),
+			receivedTuples: make(map[string]bool),
 		}
 		err = server.Register(&worker)
 		if err != nil {
@@ -118,10 +111,10 @@ func main() {
 			for {
 				// On output of tuple from a task, send it to the next task
 				out := <-worker.taskOutputs
-				nextStage := out.taskId.stage + 1
+				nextStage := out.taskId.Stage + 1
 				var r resources.AppendReply
 				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
-					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.stage, out.taskId.task),
+					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
 					Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
 				}, &r, nil)
 				if nextStage < len(worker.ips) { // send it to the next stage
@@ -258,7 +251,7 @@ func main() {
 						}
 
 						// write to task
-						targetTask := taskID{stage: stage, task: task}
+						targetTask := TaskID{Stage: stage, Task: task}
 						worker.tasksLocker.Lock()
 						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
 						if worker.tasks[targetTask].inputRate == 0 {
@@ -324,9 +317,9 @@ func main() {
 						if rate < worker.lowWatermark || rate > worker.highWatermark {
 							var r int
 							worker.rainStormLeader.Go("RainStorm.ReceiveRateUpdate", RmUpdate{
-								Stage: t.stage,
+								Stage: t.Stage,
 								Rate:  rate,
-								Task:  t.task,
+								Task:  t.Task,
 							}, &r, nil)
 						}
 					}
@@ -336,6 +329,7 @@ func main() {
 		}()
 
 		<-worker.done
+		print("This job finished")
 		_ = leaderListener.Close()
 		_ = worker.rainStormLeader.Close()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
@@ -361,7 +355,7 @@ func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 	w.tasksLocker.RLock()
 	var inputsToClose []io.WriteCloser
 	for key, value := range w.tasks {
-		if key.stage == stage+1 {
+		if key.Stage == stage+1 {
 			inputsToClose = append(inputsToClose, value.input)
 		}
 	}
@@ -370,10 +364,13 @@ func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 	for _, input := range inputsToClose {
 		_ = input.Close()
 	}
+	if stage == len(w.ips)-1 {
+		w.done <- true
+	}
 	return nil
 }
 
-func (w *Worker) AutoscaleDown(t taskID, reply *int) error {
+func (w *Worker) AutoscaleDown(t TaskID, reply *int) error {
 	w.tasksLocker.RLock()
 	defer w.tasksLocker.RUnlock()
 	_ = w.tasks[t].input.Close()
@@ -430,7 +427,7 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 
 	// Connect the task's pipe to the channel
 	tId := taskToTaskId(t)
-	go func(pipe io.Reader, t taskID, c chan<- taskOutput, cmd *exec.Cmd) {
+	go func(pipe io.Reader, t TaskID, c chan<- taskOutput, cmd *exec.Cmd) {
 		scanner := bufio.NewScanner(pipe)
 		counter := 0
 		for scanner.Scan() {
@@ -450,7 +447,12 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		err = cmd.Wait()
 		if err == nil {
 			var reply int
-			_ = w.rainStormLeader.Call("RainStorm.ReceiveTaskCompletion", t, &reply)
+			println("told leader im done", t.String())
+			err = w.rainStormLeader.Call("RainStorm.ReceiveTaskCompletion", t, &reply)
+			if err != nil {
+				println(err.Error())
+			}
+			println("leader responseed", t.String())
 		} else {
 			var reply int
 			_ = w.rainStormLeader.Call("RainStorm.ReceiveFailure", t, &reply)
@@ -543,9 +545,9 @@ func (w *Worker) KillTask(t Task, reply *int) error {
 	return nil
 }
 
-func taskToTaskId(t Task) taskID {
-	return taskID{
-		stage: t.Stage,
-		task:  t.TaskNumber,
+func taskToTaskId(t Task) TaskID {
+	return TaskID{
+		Stage: t.Stage,
+		Task:  t.TaskNumber,
 	}
 }

@@ -2,6 +2,7 @@ package resources
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"time"
 )
@@ -48,4 +49,13 @@ type InitArgs struct {
 type WorkerClient struct {
 	Conn net.Conn
 	Buf  *bufio.Reader
+}
+
+type TaskID struct {
+	Stage int
+	Task  int
+}
+
+func (t *TaskID) String() string {
+	return fmt.Sprintf("%d-%d", t.Stage, t.Task)
 }
