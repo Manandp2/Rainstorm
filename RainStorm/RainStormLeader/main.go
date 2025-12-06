@@ -15,7 +15,7 @@ import (
 
 type WorkerIps struct {
 	ips []net.IP
-	l   sync.Mutex
+	l   sync.RWMutex
 }
 
 type RainStorm struct {
@@ -25,9 +25,9 @@ type RainStorm struct {
 	HydfsDestinationFileName string
 	ExactlyOnce              bool
 	AutoScale                bool
-	InputRate                int
-	LowestRate               int
-	HighestRate              int
+	InputRate                float64
+	LowestRate               float64
+	HighestRate              float64
 	Ops                      []Operation
 	Ips                      []map[int]net.IP // [stage][task] --> IP
 	NextTaskNum              []int            // [stage]
@@ -60,11 +60,15 @@ func main() {
 	}()
 	input := make(chan RainStorm)
 	go processStdin(input)
+	hydfsClient, err := rpc.Dial("tcp", "localhost:8011") // connect to our own HydFS client
+	if err != nil {
+		fmt.Println("Failed to connect to HyDFS client from leader: " + err.Error())
+	}
+	defer hydfsClient.Close()
 
 	for {
 		r := <-input
 		// INITIATE NEW RAINSTORM APPLICATION
-		//@TODO: Make AddWorker function
 		workers.l.Lock()
 		rpcWorkers = make(map[string]*rpc.Client)
 		numSuccessfulDials = 0
@@ -79,7 +83,6 @@ func main() {
 			rpcWorkers[workerIp.String()] = worker
 			numSuccessfulDials++
 		}
-		numWorkers = len(workers.ips)
 		rpcWorkersLock.Unlock()
 
 		r.Lock = new(sync.Mutex)
@@ -111,7 +114,7 @@ func main() {
 			4. complete changes
 		*/
 		appServer := rpc.NewServer()
-		err := appServer.Register(r)
+		err = appServer.Register(r)
 		if err != nil {
 			fmt.Println(err)
 			continue
@@ -123,16 +126,20 @@ func main() {
 		}
 		go appServer.Accept(globalRmListener)
 
-		// @TODO: needs to wait for the application to complete before cleaning up --> come back to this
+		//@TODO: read srcFile from HyDFS and send into system at Input Rate for this application
+		// send stage -1 is done once done reading from the file
+		// read in from local; output on HyDFS
+
+		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
 		<-appCompletedChan //blocking
 		println("RainStorm Application completed!")
 
 		// CLEANUP: do once the current RainStorm application is done
-		workers.l.Lock()
+		rpcWorkersLock.Lock()
 		for _, worker := range rpcWorkers {
 			_ = worker.Close()
 		}
-		workers.l.Unlock()
+		rpcWorkersLock.Unlock()
 
 		err = globalRmListener.Close()
 		if err != nil {
@@ -142,17 +149,36 @@ func main() {
 
 }
 
-//@TODO: upon failure, the worker needs to reboot the task with the same taskID
+func (w *WorkerIps) AddWorkers(args net.IP, reply *int) error {
+	workers.l.Lock()
+	defer workers.l.Unlock()
+	workers.ips = append(workers.ips, args)
+	numWorkers++
+	return nil
+}
 
+func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
+	// restart the task on the next worker in the cycle
+	app.Lock.Lock()
+	defer app.Lock.Unlock()
+	if _, exists := app.Ips[task.Stage][task.TaskNumber]; !exists {
+		fmt.Printf("Failing task:%d at stage: %d does not exist", task.TaskNumber, task.Stage)
+	} else {
+		workers.l.RLock()
+		app.Ips[task.Stage][task.TaskNumber] = workers.ips[app.NextAvailableVM%numWorkers]
+		workers.l.RUnlock()
+		app.NextAvailableVM++
+		app.sendIps()
+	}
+	return nil
+}
 func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 	app.Lock.Lock()
 	defer app.Lock.Unlock()
 	if app.AutoScale {
 		if args.Rate < app.LowestRate {
 			//	add a task to this stage
-			workers.l.Lock()
 			app.addTask(args.Stage)
-			workers.l.Unlock()
 			app.sendIps()
 		} else if args.Rate > app.HighestRate {
 			//	remove a task from this stage
@@ -230,6 +256,8 @@ func (app *RainStorm) initWorker() { // MUST BE CALLED INSIDE RAINSTORM LOCK -->
 		Ops:           app.Ops,
 		Time:          time.Now(),
 		HyDFSDestFile: app.HydfsDestinationFileName,
+		LowWatermark:  app.LowestRate,
+		HighWatermark: app.HighestRate,
 	}
 	for _, worker := range rpcWorkers {
 		var reply int
@@ -252,7 +280,9 @@ func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CAL
 	//	app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
 	//}
 	taskNum := app.NextTaskNum[stageNum]
+	workers.l.RLock()
 	app.Ips[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
+	workers.l.RUnlock()
 	//app.TaskCompletion[stageNum].StateTracker[taskNum] = false
 	app.NextTaskNum[stageNum]++
 	app.NextAvailableVM++
@@ -273,7 +303,7 @@ func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CAL
 }
 
 func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
-	if len(app.Ips[stageNum]) <= 1 {             // only 1 task remaining in the stage
+	if len(app.Ips[stageNum]) <= 1 { // only 1 task remaining in the stage
 		return
 	}
 	var taskNum int
@@ -360,21 +390,21 @@ func processStdin(i1 chan<- RainStorm) {
 					}
 					break
 				case i == len(splits)-3: // InputRate
-					rainStorm.InputRate, err = strconv.Atoi(splits[i])
+					rainStorm.InputRate, err = strconv.ParseFloat(splits[i], 64)
 					if err != nil {
 						fmt.Println("Failed to parse InputRate: " + err.Error())
 						bad = true
 					}
 					break
 				case i == len(splits)-2: // LowestRate
-					rainStorm.LowestRate, err = strconv.Atoi(splits[i])
+					rainStorm.LowestRate, err = strconv.ParseFloat(splits[i], 64)
 					if err != nil {
 						fmt.Println("Failed to parse LowestRate: " + err.Error())
 						bad = true
 					}
 					break
 				case i == len(splits)-1: // HighestRate
-					rainStorm.HighestRate, err = strconv.Atoi(splits[i])
+					rainStorm.HighestRate, err = strconv.ParseFloat(splits[i], 64)
 					if err != nil {
 						fmt.Println("Failed to parse HighestRate: " + err.Error())
 						bad = true
@@ -388,6 +418,7 @@ func processStdin(i1 chan<- RainStorm) {
 			break
 
 		case "kill_task":
+			//@TODO: add implementation for this
 			break
 
 		case "list_tasks":
