@@ -78,6 +78,9 @@ func main() {
 
 	for {
 		r := <-input
+		if numWorkers == 0 {
+			panic("No workers")
+		}
 		// INITIATE NEW RAINSTORM APPLICATION
 		//Global RM
 		/*
@@ -209,11 +212,11 @@ func main() {
 						delete(tupleClients, nextTaskIp.String())
 						continue
 					}
-					newClient := &WorkerClient{
+					client = &WorkerClient{
 						Conn: conn,
 						Buf:  bufio.NewReader(conn),
 					}
-					tupleClients[nextTaskIp.String()] = newClient
+					tupleClients[nextTaskIp.String()] = client
 				}
 
 				// Send the tuple
@@ -241,6 +244,7 @@ func main() {
 					time.Sleep(targetTime.Sub(now))
 				}
 			}
+			r.sendStageCompletion(-1)
 			_ = inputFile.Close()
 		}()
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
@@ -248,6 +252,7 @@ func main() {
 		println("RainStorm Application completed!")
 
 		// CLEANUP: do once the current RainStorm application is done
+		// @TODO: add cleanup for client connections when sending tuples
 		rpcWorkersLock.Lock()
 		for _, worker := range rpcWorkers {
 			_ = worker.Close()
@@ -308,26 +313,25 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 	return nil
 }
 
-func (app *RainStorm) ReceiveTaskCompletion(args Task, reply *int) error {
+func (app *RainStorm) ReceiveTaskCompletion(args TaskID, reply *int) error {
 	//stage completion manager --> manage markers from tasks saying they are done
 	app.Lock.Lock()
 	defer app.Lock.Unlock()
-	if _, exists := app.Ips[args.Stage][args.TaskNumber]; exists {
-		delete(app.Ips[args.Stage], args.TaskNumber)
+	if _, exists := app.Ips[args.Stage][args.Task]; exists {
+		delete(app.Ips[args.Stage], args.Task)
 		//app.CurNumTasks[args.Stage] -= 1
 		app.sendIps()
 		if len(app.Ips[args.Stage]) == 0 {
 			// stage completed
-			if args.Stage+1 < app.NumStages {
-				app.sendStageCompletion(args.Stage)
-			} else {
+			app.sendStageCompletion(args.Stage)
+			if args.Stage+1 == app.NumStages {
 				appCompletedChan <- true
 			}
 		}
 
 	} else {
 		//do nothing because this should never happen
-		fmt.Printf("Received task completion for: %d, BUT should not have received this\n", args.TaskNumber)
+		fmt.Printf("Received task completion for: %d, BUT should not have received this\n", args.Task)
 	}
 	return nil
 }
