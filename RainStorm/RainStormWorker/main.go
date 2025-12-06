@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	. "g14-mp4/RainStorm/resources"
@@ -133,7 +134,11 @@ func main() {
 						if err != nil {
 							hashIndex = 0
 						}
-						key = strings.Split(out.output, ",")[hashIndex]
+						reader := csv.NewReader(strings.NewReader(out.output))
+						tuple, err := reader.Read()
+						if err == nil && hashIndex < len(tuple) {
+							key = tuple[hashIndex]
+						}
 					}
 
 					// Find which client gets the next tuple
