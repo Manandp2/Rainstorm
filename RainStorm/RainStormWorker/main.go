@@ -90,17 +90,15 @@ func main() {
 	for {
 		println("beginning of loop ")
 		server := rpc.NewServer()
-		rainStormLeader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+GlobalRMPort)
 		if err != nil {
 			continue // try again
 		}
 		worker := Worker{
-			rainStormLeader: rainStormLeader,
-			hydfsClient:     hydfsClient,
-			done:            make(chan bool),
-			tasks:           make(map[taskID]*localTask),
-			taskOutputs:     make(chan taskOutput, 100),
-			connections:     make(map[string]*WorkerClient),
+			hydfsClient: hydfsClient,
+			done:        make(chan bool),
+			tasks:       make(map[taskID]*localTask),
+			taskOutputs: make(chan taskOutput, 100),
+			connections: make(map[string]*WorkerClient),
 		}
 		err = server.Register(&worker)
 		if err != nil {
@@ -339,7 +337,7 @@ func main() {
 
 		<-worker.done
 		_ = leaderListener.Close()
-		_ = rainStormLeader.Close()
+		_ = worker.rainStormLeader.Close()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
 	}
 
@@ -388,6 +386,8 @@ func (w *Worker) Initialize(args InitArgs, reply *int) error {
 	w.hydfsDestFile = args.HyDFSDestFile
 	w.lowWatermark = args.LowWatermark
 	w.highWatermark = args.HighWatermark
+	rainStormLeader, _ := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+GlobalRMPort)
+	w.rainStormLeader = rainStormLeader
 	return nil
 }
 

@@ -36,6 +36,7 @@ type RainStorm struct {
 	NextAvailableVM          int
 	Stage1UpdatesChan        chan map[int]net.IP
 	Lock                     *sync.Mutex
+	DoneReading              bool
 }
 
 const clientTimeout = time.Second * 3
@@ -78,44 +79,6 @@ func main() {
 	for {
 		r := <-input
 		// INITIATE NEW RAINSTORM APPLICATION
-		workers.l.Lock()
-		rpcWorkers = make(map[string]*rpc.Client)
-		numSuccessfulDials = 0
-		rpcWorkersLock.Lock()
-		for _, workerIp := range workers.ips {
-			//collect list of tasks for this worker
-			worker, err := rpc.Dial("tcp", workerIp.String()+AssignmentPort)
-			if err != nil {
-				fmt.Println("Unable to connect to worker: " + err.Error())
-				continue
-			}
-			rpcWorkers[workerIp.String()] = worker
-			numSuccessfulDials++
-		}
-		rpcWorkersLock.Unlock()
-
-		r.Lock = new(sync.Mutex)
-		r.Lock.Lock()
-		r.Ips = make([]map[int]net.IP, r.NumStages)
-		r.NextTaskNum = make([]int, r.NumStages)
-		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
-		//r.TaskCompletion = make([]CompletionTuple, r.NumStages)
-		r.initWorker()
-		r.NextAvailableVM = 0
-		for i := range r.NumStages {
-			r.Ips[i] = make(map[int]net.IP)
-			//r.TaskCompletion[i] = CompletionTuple{
-			//	Counter:      0,
-			//	StateTracker: make(map[int]bool),
-			//}
-			for range r.NumTasksPerStage {
-				r.addTask(i)
-			}
-		}
-		workers.l.Unlock()
-		r.sendIps()
-		r.Lock.Unlock()
-
 		//Global RM
 		/*
 			1. open listener for current task input rates from workers
@@ -135,6 +98,45 @@ func main() {
 			continue
 		}
 		go appServer.Accept(globalRmListener)
+
+		workers.l.RLock()
+		rpcWorkers = make(map[string]*rpc.Client)
+		numSuccessfulDials = 0
+		rpcWorkersLock.Lock()
+		for _, workerIp := range workers.ips {
+			//collect list of tasks for this worker
+			worker, err := rpc.Dial("tcp", workerIp.String()+AssignmentPort)
+			if err != nil {
+				fmt.Println("Unable to connect to worker: " + err.Error())
+				continue
+			}
+			rpcWorkers[workerIp.String()] = worker
+			numSuccessfulDials++
+		}
+		workers.l.RUnlock()
+		rpcWorkersLock.Unlock()
+
+		r.Lock = new(sync.Mutex)
+		r.Lock.Lock()
+		r.Ips = make([]map[int]net.IP, r.NumStages)
+		r.NextTaskNum = make([]int, r.NumStages)
+		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
+		r.DoneReading = false
+		//r.TaskCompletion = make([]CompletionTuple, r.NumStages)
+		r.initWorker()
+		r.NextAvailableVM = 0
+		for i := range r.NumStages {
+			r.Ips[i] = make(map[int]net.IP)
+			//r.TaskCompletion[i] = CompletionTuple{
+			//	Counter:      0,
+			//	StateTracker: make(map[int]bool),
+			//}
+			for range r.NumTasksPerStage {
+				r.addTask(i)
+			}
+		}
+		r.sendIps()
+		r.Lock.Unlock()
 
 		//@TODO: read srcFile from HyDFS and send into system at Input Rate for this application
 		// send stage -1 is done once done reading from the file
@@ -175,6 +177,9 @@ func main() {
 					line    string
 					lineNum int
 				}{line: "", lineNum: -1}
+				r.Lock.Lock()
+				r.DoneReading = true
+				r.Lock.Unlock()
 			}()
 			for {
 				tuple := <-readingChan
@@ -221,7 +226,10 @@ func main() {
 				ack, err := client.Buf.ReadString('\n')
 				expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
 				if err != nil || strings.TrimSpace(ack) != expectedAck {
+					client.Conn.Close()
+					delete(tupleClients, nextTaskIp.String())
 					readingChan <- tuple
+					continue
 				}
 
 				expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
@@ -254,7 +262,7 @@ func main() {
 
 }
 
-func (w *WorkerIps) AddWorkers(args net.IP, reply *int) error {
+func (w *WorkerIps) AddWorker(args net.IP, reply *int) error {
 	workers.l.Lock()
 	defer workers.l.Unlock()
 	workers.ips = append(workers.ips, args)
@@ -273,7 +281,7 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 		app.Ips[task.Stage][task.TaskNumber] = workers.ips[app.NextAvailableVM%numWorkers]
 		workers.l.RUnlock()
 		app.NextAvailableVM++
-		if task.Stage == 0 {
+		if task.Stage == 0 && !app.DoneReading {
 			temp := make(map[int]net.IP)
 			for t, ip := range app.Ips[0] {
 				temp[t] = ip
@@ -398,7 +406,7 @@ func (app *RainStorm) addTask(stageNum int) { //MUST BE WRAPPED IN LOCK WHEN CAL
 	//app.TaskCompletion[stageNum].StateTracker[taskNum] = false
 	app.NextTaskNum[stageNum]++
 	app.NextAvailableVM++
-	if stageNum == 0 {
+	if stageNum == 0 && !app.DoneReading {
 		temp := make(map[int]net.IP)
 		for task, ip := range app.Ips[0] {
 			temp[task] = ip
@@ -439,7 +447,7 @@ func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK W
 	}
 
 	delete(app.Ips[stageNum], taskNum)
-	if stageNum == 0 {
+	if stageNum == 0 && !app.DoneReading {
 		temp := make(map[int]net.IP)
 		for task, ip := range app.Ips[0] {
 			temp[task] = ip
