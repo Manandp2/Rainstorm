@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	. "g14-mp4/RainStorm/resources"
+	"g14-mp4/mp3/resources"
 	"net"
 	"net/rpc"
 	"os"
@@ -144,6 +145,15 @@ func main() {
 		//@TODO: read srcFile from HyDFS and send into system at Input Rate for this application
 		// send stage -1 is done once done reading from the file
 		// read in from local; output on HyDFS
+		var createReply []resources.AddFileReply
+		err = hydfsClient.Call("Client.RemoteCreate", &resources.RemoteFileArgs{
+			RemoteName: r.HydfsDestinationFileName,
+			Content:    make([]byte, 0),
+		}, &createReply)
+		if err != nil {
+			fmt.Println(err.Error())
+		}
+
 		inputFile, err := os.Open(filepath.Join(dataDir, r.HydfsSrcDirectory))
 		if err != nil {
 			fmt.Println("Unable to open src directory: " + err.Error())
