@@ -76,7 +76,7 @@ func main() {
 		return
 	}
 	var reply int
-	err = leader.Call("WorkerIps.AddWorkers", getOutboundIP(), &reply)
+	err = leader.Call("WorkerIps.AddWorker", getOutboundIP(), &reply)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -122,7 +122,7 @@ func main() {
 				var r resources.AppendReply
 				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.stage, out.taskId.task),
-					Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s", out.taskId.String(), out.tupleId, out.output)),
+					Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
 				}, &r, nil)
 				if nextStage < len(worker.ips) { // send it to the next stage
 					key := out.output
@@ -279,7 +279,7 @@ func main() {
 						var r resources.AppendReply
 						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 							RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
-							Content:    []byte(fmt.Sprintf("RECEIVED,%s,%s", split[0], split[3])),
+							Content:    []byte(fmt.Sprintf("RECEIVED,%s,%s\n", split[0], split[3])),
 						}, &r, nil)
 					}
 				}(conn)
