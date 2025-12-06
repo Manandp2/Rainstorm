@@ -29,7 +29,7 @@ type Task struct {
 
 type RmUpdate struct {
 	Stage int
-	Rate  int
+	Rate  float64
 	Task  int
 }
 
@@ -37,4 +37,6 @@ type InitArgs struct {
 	Ops           []Operation
 	Time          time.Time
 	HyDFSDestFile string
+	LowWatermark  float64
+	HighWatermark float64
 }

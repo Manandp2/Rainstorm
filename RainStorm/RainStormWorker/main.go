@@ -19,9 +19,11 @@ import (
 )
 
 type localTask struct {
-	cmd    *exec.Cmd
-	input  io.WriteCloser // To send tuples to tasks (receives data from tcp)
-	output io.ReadCloser  // To send tuples to the next stage (sends data through tcp)
+	cmd       *exec.Cmd
+	input     io.WriteCloser // To send tuples to tasks (receives data from tcp)
+	output    io.ReadCloser  // To send tuples to the next stage (sends data through tcp)
+	inputRate int
+	startTime time.Time
 }
 type taskID struct {
 	stage int
@@ -42,10 +44,12 @@ type Worker struct {
 	rainStormStartTime string
 	hydfsClient        *rpc.Client
 	hydfsDestFile      string
+	lowWatermark       float64
+	highWatermark      float64
 
 	done        chan bool
 	tasksLocker sync.RWMutex
-	tasks       map[taskID]localTask
+	tasks       map[taskID]*localTask
 
 	ips           []map[int]net.IP // ips of machines with [stage][task] indexing
 	taskIDLocker  sync.RWMutex
@@ -94,7 +98,7 @@ func main() {
 			rainStormLeader: rainStormLeader,
 			hydfsClient:     hydfsClient,
 			done:            make(chan bool),
-			tasks:           make(map[taskID]localTask),
+			tasks:           make(map[taskID]*localTask),
 			taskOutputs:     make(chan taskOutput, 100),
 			connections:     make(map[string]*WorkerClient),
 		}
@@ -252,6 +256,10 @@ func main() {
 						targetTask := taskID{stage: stage, task: task}
 						worker.tasksLocker.RLock()
 						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
+						if worker.tasks[targetTask].inputRate == 0 {
+							worker.tasks[targetTask].startTime = time.Now()
+						}
+						worker.tasks[targetTask].inputRate++
 						worker.tasksLocker.RUnlock()
 						if err != nil {
 							continue // we weren't able to write, so no ack
@@ -269,6 +277,30 @@ func main() {
 						}, &r, nil)
 					}
 				}(conn)
+			}
+		}()
+
+		// Local Resource Manager
+		go func() {
+			ticker := time.Tick(3 * time.Second)
+			for {
+				<-ticker
+				worker.tasksLocker.RLock()
+				for t, task := range worker.tasks {
+					duration := time.Now().Sub(task.startTime).Seconds()
+					if duration > 0 {
+						rate := float64(task.inputRate) / duration
+						if rate < worker.lowWatermark || rate > worker.highWatermark {
+							var r int
+							_ = worker.rainStormLeader.Call("RainStorm.ReceiveRateUpdate", RmUpdate{
+								Stage: t.stage,
+								Rate:  rate,
+								Task:  t.task,
+							}, &r)
+						}
+					}
+				}
+				worker.tasksLocker.RUnlock()
 			}
 		}()
 
@@ -316,6 +348,8 @@ func (w *Worker) Initialize(args InitArgs, reply *int) error {
 	w.stageOperations = args.Ops
 	w.rainStormStartTime = args.Time.Format("20060102150405")
 	w.hydfsDestFile = args.HyDFSDestFile
+	w.lowWatermark = args.LowWatermark
+	w.highWatermark = args.HighWatermark
 	return nil
 }
 
@@ -391,7 +425,7 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 
 	// Add the task to the map
 	w.tasksLocker.Lock()
-	w.tasks[tId] = localTask{
+	w.tasks[tId] = &localTask{
 		cmd:    task,
 		input:  taskStdin,
 		output: taskStdout,
