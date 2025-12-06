@@ -87,7 +87,7 @@ func main() {
 			4. complete changes
 		*/
 		appServer := rpc.NewServer()
-		err = appServer.Register(r)
+		err = appServer.Register(&r)
 		if err != nil {
 			fmt.Println(err)
 			continue
