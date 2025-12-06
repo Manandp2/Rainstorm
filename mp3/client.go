@@ -351,7 +351,9 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 	waitChan := make(chan *rpc.Call, numNodesWanted)
 
 	replies := make([]resources.AddFileReply, numNodesWanted)
-
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("no nodes found for remote %s", remoteName)
+	}
 	randNum := rand.Intn(len(nodes))
 
 	for i := 0; i < numNodesWanted; i++ {
