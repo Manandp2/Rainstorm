@@ -8,7 +8,10 @@ import (
 )
 
 func main() {
-	pattern := os.Args[1]
+	pattern := ""
+	if len(os.Args) >= 2 {
+		pattern = os.Args[1]
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		text := scanner.Text()
