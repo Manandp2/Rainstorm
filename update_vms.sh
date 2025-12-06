@@ -1,5 +1,5 @@
 #!/bin/zsh
-mpnum="3"
+mpnum="4"
 for i in {1..10} ; do
   echo "working on vm${i}"
     script="

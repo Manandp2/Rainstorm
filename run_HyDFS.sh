@@ -1,5 +1,5 @@
 #!/bin/zsh
-processName="g14-mp2"
+processName="mp3"
 
 for i in {1..10}; do
   host="fa25-cs425-14$(printf %02d "$i").cs.illinois.edu"
