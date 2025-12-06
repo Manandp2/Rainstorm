@@ -98,12 +98,12 @@ func main() {
 		}
 		leaderListener, err := net.Listen("tcp", AssignmentPort)
 		if err != nil {
-			fmt.Println(err)
+			//fmt.Println(err)
 			time.Sleep(1 * time.Second)
 			continue
 		}
 		go server.Accept(leaderListener)
-
+		tupleSendConn, err := net.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+TuplePort)
 		// Goroutine for sending out tuples
 		go func() {
 			for {
@@ -191,18 +191,15 @@ func main() {
 						worker.taskOutputs <- out // didn't receive the ack, just try again
 					}
 				} else { // output data to the distributed file system
-					var r []resources.AppendReply
-					worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
-						RemoteName: worker.hydfsDestFile,
-						Content:    []byte(out.output + "\n"),
-					}, &r, nil)
-					fmt.Println(out.output)
-					//if err != nil {
-					//	_, _ = os.Stderr.WriteString(err.Error() + ", retrying tuple" + out.output + "\n")
-					//	worker.taskOutputs <- out
-					//} else {
-					//	fmt.Println(out.output)
-					//}
+					// Send the tuple to the leader, they will write to HyDFS
+					_, _ = fmt.Fprintf(tupleSendConn, "%d,%s", out.taskId.Task, out.output)
+					//var r []resources.AppendReply
+					//worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+					//	RemoteName: worker.hydfsDestFile,
+					//	Content:    []byte(out.output),
+					//}, &r, nil)
+					//
+					//fmt.Println(out.output)
 				}
 			}
 		}()
@@ -333,9 +330,10 @@ func main() {
 		}()
 
 		<-worker.done
-		print("This job finished")
+		println("This job finished")
 		_ = leaderListener.Close()
 		_ = worker.rainStormLeader.Close()
+		_ = tupleSendConn.Close()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
 	}
 
@@ -456,7 +454,7 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			if err != nil {
 				println(err.Error())
 			}
-			println("leader responseed", t.String())
+			println("leader responded", t.String())
 		} else {
 			var reply int
 			_ = w.rainStormLeader.Call("RainStorm.ReceiveFailure", t, &reply)
