@@ -65,11 +65,6 @@ type Worker struct {
 	receivedTuples map[string]bool // key = taskId-TupleId, value is dummy
 }
 
-type WorkerClient struct {
-	conn net.Conn
-	buf  *bufio.Reader
-}
-
 const clientTimeout = time.Second * 3
 const ACK = "ACK"
 
@@ -164,8 +159,8 @@ func main() {
 							continue
 						}
 						newClient := &WorkerClient{
-							conn: conn,
-							buf:  bufio.NewReader(conn),
+							Conn: conn,
+							Buf:  bufio.NewReader(conn),
 						}
 
 						worker.connectionsLock.Lock()
@@ -182,12 +177,12 @@ func main() {
 					}
 
 					// Send the tuple
-					_ = client.conn.SetWriteDeadline(time.Now().Add(clientTimeout))
+					_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
 					// Id-Id, stage, task, data
-					_, err = fmt.Fprintf(client.conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
+					_, err = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
 
 					if err != nil { // Write didn't go through, disconnect and try again
-						_ = client.conn.Close()
+						_ = client.Conn.Close()
 						worker.connectionsLock.Lock()
 						delete(worker.connections, nextWorker)
 						worker.connectionsLock.Unlock()
@@ -196,8 +191,8 @@ func main() {
 					}
 
 					// Wait for the ack
-					_ = client.conn.SetReadDeadline(time.Now().Add(clientTimeout))
-					ack, err := client.buf.ReadString('\n')
+					_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
+					ack, err := client.Buf.ReadString('\n')
 					expectedAck := fmt.Sprintf("%s-%d-%s", out.taskId.String(), out.tupleId, ACK)
 					if err != nil || strings.TrimSpace(ack) != expectedAck {
 						worker.taskOutputs <- out // didn't receive the ack, just try again

@@ -1,6 +1,10 @@
 package resources
 
-import "time"
+import (
+	"bufio"
+	"net"
+	"time"
+)
 
 const IntroducePort = ":8020"
 const AssignmentPort = ":8021"
@@ -39,4 +43,9 @@ type InitArgs struct {
 	HyDFSDestFile string
 	LowWatermark  float64
 	HighWatermark float64
+}
+
+type WorkerClient struct {
+	Conn net.Conn
+	Buf  *bufio.Reader
 }
