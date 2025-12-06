@@ -80,7 +80,6 @@ func main() {
 		return
 	}
 	for {
-		println("beginning of loop ")
 		server := rpc.NewServer()
 		if err != nil {
 			continue // try again
@@ -104,7 +103,6 @@ func main() {
 			continue
 		}
 		go server.Accept(leaderListener)
-		println("got to after making server")
 
 		// Goroutine for sending out tuples
 		go func() {
@@ -112,7 +110,7 @@ func main() {
 				// On output of tuple from a task, send it to the next task
 				out := <-worker.taskOutputs
 				nextStage := out.taskId.Stage + 1
-				var r resources.AppendReply
+				var r []resources.AppendReply
 				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
 					Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
@@ -193,12 +191,18 @@ func main() {
 						worker.taskOutputs <- out // didn't receive the ack, just try again
 					}
 				} else { // output data to the distributed file system
-					var r resources.AppendReply
+					var r []resources.AppendReply
 					worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 						RemoteName: worker.hydfsDestFile,
 						Content:    []byte(out.output + "\n"),
 					}, &r, nil)
 					fmt.Println(out.output)
+					//if err != nil {
+					//	_, _ = os.Stderr.WriteString(err.Error() + ", retrying tuple" + out.output + "\n")
+					//	worker.taskOutputs <- out
+					//} else {
+					//	fmt.Println(out.output)
+					//}
 				}
 			}
 		}()
@@ -269,7 +273,7 @@ func main() {
 						if err != nil {
 							continue
 						}
-						var r resources.AppendReply
+						var r []resources.AppendReply
 						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 							RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
 							Content:    []byte(fmt.Sprintf("RECEIVED,%s,%s\n", split[0], split[3])),
