@@ -339,8 +339,11 @@ func (c *Client) MultiAppend(args resources.MultiAppendArgs, reply *int) error {
 
 // sendDataToNodes performs the actual network operations with the server using raw bytes
 func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWanted int, addType string) ([]resources.AddFileReply, error) {
+
 	c.appendNumbersMutex.Lock()
-	defer c.appendNumbersMutex.Unlock()
+	localAppendNumber := c.appendNumber
+	c.appendNumber++
+	c.appendNumbersMutex.Unlock()
 
 	nodes, err := c.getReplicaNodes(remoteName)
 	if err != nil {
@@ -364,7 +367,7 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 			Content:      content,
 			AppendNumber: resources.AppendNumber{
 				NodeId:  c.myNode,
-				Counter: c.appendNumber,
+				Counter: localAppendNumber,
 			},
 		}
 
@@ -378,8 +381,6 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 	for i := 0; i < serversCalled; i++ {
 		<-waitChan
 	}
-
-	c.appendNumber++
 
 	return replies, nil
 }
