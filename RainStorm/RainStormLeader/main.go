@@ -33,7 +33,7 @@ type RainStorm struct {
 	LowestRate               float64
 	HighestRate              float64
 	Ops                      []Operation
-	TaskInformation          []map[int]*TaskInfo // [stage][task] --> IP
+	TaskInformation          []map[int]*TaskInfo // [stage][task] --> IP, PID
 	NextTaskNum              []int               // [stage]
 	NextAvailableVM          int
 	Stage1UpdatesChan        chan map[int]net.IP
@@ -91,6 +91,10 @@ func main() {
 		r.LogFileChan = make(chan string, 100)
 		r.StartTime = time.Now()
 
+		tupleListener, err := net.Listen("tcp", TuplePort)
+		if err != nil {
+			return
+		}
 		//logger
 		go func() {
 			path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.Format("20060102150405"))
@@ -204,6 +208,53 @@ func main() {
 		if err != nil {
 			fmt.Println("Unable to open src directory: " + err.Error())
 		}
+		//buffered write to HyDFS output file
+		readingChan := make(chan string, 200)
+		go func() {
+			buffer := make([]byte, 4096)
+			for {
+				line := <-readingChan
+				buffer = append(buffer, []byte(line)...)
+				var reply []resources.AppendReply
+				_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
+					RemoteName: r.HydfsDestinationFileName,
+					Content:    buffer,
+				}, &reply)
+			}
+		}()
+
+		//listen for tuples to print to console and buffered append to hydfs
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					_ = tupleListener.Close()
+					return
+				default:
+					conn, err := tupleListener.Accept()
+					if err != nil {
+						continue
+					}
+					go func(conn net.Conn) {
+						defer conn.Close()
+						reader := bufio.NewReader(conn)
+						for {
+							select {
+							case <-ctx.Done():
+								return
+							default:
+								line, err := reader.ReadString('\n')
+								if err != nil {
+									return // connection closed/failed
+								}
+								fmt.Println(line)
+								readingChan <- line
+							}
+						}
+					}(conn)
+				}
+			}
+		}()
 
 		// reading src file and sending lines to tasks
 		go func() {
@@ -321,49 +372,6 @@ func main() {
 			}
 			println("done closing conns")
 			_ = inputFile.Close()
-		}()
-
-		readingChan := make(chan string, 200)
-		go func() {
-			buffer := make([]byte, 4096)
-			for {
-				line := <-readingChan
-				buffer = append(buffer, []byte(line)...)
-				var reply []resources.AppendReply
-				_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
-					RemoteName: r.HydfsDestinationFileName,
-					Content:    buffer,
-				}, &reply)
-			}
-		}()
-		//listen for tuples to print to console and buffered append to hydfs
-		go func() {
-			tupleListener, err := net.Listen("tcp", TuplePort)
-			if err != nil {
-				return
-			}
-			defer func(tupleListener net.Listener) {
-				_ = tupleListener.Close()
-			}(tupleListener)
-
-			for {
-				conn, err := tupleListener.Accept()
-				if err != nil {
-					continue
-				}
-				go func(conn net.Conn) {
-					defer conn.Close()
-					reader := bufio.NewReader(conn)
-					for {
-						line, err := reader.ReadString('\n')
-						if err != nil {
-							return // connection closed/failed
-						}
-						fmt.Println(line)
-						readingChan <- line
-					}
-				}(conn)
-			}
 		}()
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
 		<-appCompletedChan //blocking
