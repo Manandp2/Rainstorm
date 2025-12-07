@@ -339,7 +339,6 @@ func (c *Client) MultiAppend(args resources.MultiAppendArgs, reply *int) error {
 
 // sendDataToNodes performs the actual network operations with the server using raw bytes
 func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWanted int, addType string) ([]resources.AddFileReply, error) {
-
 	c.appendNumbersMutex.Lock()
 	localAppendNumber := c.appendNumber
 	c.appendNumber++
@@ -349,37 +348,65 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 	if err != nil {
 		return nil, err
 	}
-
-	serversCalled := 0
-	waitChan := make(chan *rpc.Call, numNodesWanted)
-
-	replies := make([]resources.AddFileReply, numNodesWanted)
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("no nodes found for remote %s", remoteName)
 	}
+
+	args := resources.AddFileArgs{
+		HDFSFileName: remoteName,
+		Content:      content,
+		AppendNumber: resources.AppendNumber{
+			NodeId:  c.myNode,
+			Counter: localAppendNumber,
+		},
+	}
+
+	successfulWrites := 0
+	replies := make([]resources.AddFileReply, 0)
+
+	// We need to loop through the replicas.
+	// We start at a random offset to balance load, but we must try ALL of them if needed.
 	randNum := rand.Intn(len(nodes))
 
-	for i := 0; i < numNodesWanted; i++ {
-		curNode := nodes[(randNum+i)%len(nodes)]
-
-		args := resources.AddFileArgs{
-			HDFSFileName: remoteName,
-			Content:      content,
-			AppendNumber: resources.AppendNumber{
-				NodeId:  c.myNode,
-				Counter: localAppendNumber,
-			},
+	// Attempt to write to replicas until we hit our target (numNodesWanted) or we run out of nodes to try.
+	for i := 0; i < len(nodes); i++ {
+		// If we have already reached our quorum, we can stop.
+		if successfulWrites >= numNodesWanted {
+			break
 		}
 
+		idx := (randNum + i) % len(nodes)
+		curNode := nodes[idx]
+
 		curServer, err := rpc.Dial("tcp", curNode.IP()+":8010")
-		if err == nil {
-			curServer.Go(fmt.Sprintf("Server.%s", addType), &args, &replies[i], waitChan)
-			serversCalled++
+		if err != nil {
+			// If we can't connect, just log it and try the next node
+			fmt.Printf("Failed to dial %s: %v\n", curNode.IP(), err)
+			continue
+		}
+
+		var reply resources.AddFileReply
+		rpcMethod := fmt.Sprintf("Server.%s", addType)
+
+		err = curServer.Call(rpcMethod, &args, &reply)
+		_ = curServer.Close() // Always close the connection
+
+		if err != nil {
+			fmt.Printf("RPC call to %s failed: %v\n", curNode.IP(), err)
+			continue
+		}
+
+		if reply.Err == nil {
+			successfulWrites++
+			replies = append(replies, reply)
+		} else {
+			replies = append(replies, reply)
 		}
 	}
 
-	for i := 0; i < serversCalled; i++ {
-		<-waitChan
+	// Check if we met the quorum requirement
+	if successfulWrites < numNodesWanted {
+		return replies, fmt.Errorf("failed to achieve quorum: wanted %d, got %d", numNodesWanted, successfulWrites)
 	}
 
 	return replies, nil
