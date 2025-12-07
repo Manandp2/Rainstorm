@@ -418,8 +418,9 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 	return nil
 }
 func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
-	//@TODO: write to leader logs wheen receiving a tuple rate
+	//@TODO: write to leader logs when receiving a tuple rate
 	//app.LogFile
+	app.LogFileChan <- fmt.Sprintf("Rate: %.2f TaskID: %d Stage %d", args.Rate, args.Task, args.Stage)
 	if app.AutoScale {
 		if args.Rate < app.LowestRate {
 			//	add a task to this stage
