@@ -217,27 +217,31 @@ func main() {
 		outputChan := make(chan string, 200)
 		go func() {
 			buffer := bytes.Buffer{}
+			flush := func() {
+				if buffer.Len() > 0 {
+					var reply []resources.AppendReply
+					_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
+						RemoteName: r.HydfsDestinationFileName,
+						Content:    buffer.Bytes(),
+					}, &reply)
+					buffer.Reset()
+				}
+			}
 			for {
 				select {
 				case <-ctx.Done():
+					for len(outputChan) > 0 {
+						line := <-outputChan
+						buffer.WriteString(line)
+					}
 					if buffer.Len() > 0 {
-						var reply []resources.AppendReply
-						_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
-							RemoteName: r.HydfsDestinationFileName,
-							Content:    buffer.Bytes(),
-						}, &reply)
-						buffer.Reset()
+						flush()
 					}
 					return
 				case line := <-outputChan:
 					buffer.WriteString(line)
 					if buffer.Len() > 4096 {
-						var reply []resources.AppendReply
-						_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
-							RemoteName: r.HydfsDestinationFileName,
-							Content:    buffer.Bytes(),
-						}, &reply)
-						buffer.Reset()
+						flush()
 					}
 				}
 			}
