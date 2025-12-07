@@ -359,6 +359,7 @@ func main() {
 						// ahead of schedule, sleep to sync with desired rate
 						time.Sleep(targetTime.Sub(now))
 					}
+					numProcessed++
 				default:
 					// reached if channel is empty
 					if eofReceived {
