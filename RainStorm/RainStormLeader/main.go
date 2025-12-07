@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	. "g14-mp4/RainStorm/resources"
@@ -215,15 +216,30 @@ func main() {
 		//buffered write to HyDFS output file
 		outputChan := make(chan string, 200)
 		go func() {
-			buffer := make([]byte, 4096)
+			buffer := bytes.Buffer{}
 			for {
-				line := <-outputChan
-				buffer = append(buffer, []byte(line)...)
-				var reply []resources.AppendReply
-				_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
-					RemoteName: r.HydfsDestinationFileName,
-					Content:    buffer,
-				}, &reply)
+				select {
+				case <-ctx.Done():
+					if buffer.Len() > 0 {
+						var reply []resources.AppendReply
+						_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
+							RemoteName: r.HydfsDestinationFileName,
+							Content:    buffer.Bytes(),
+						}, &reply)
+						buffer.Reset()
+					}
+					return
+				case line := <-outputChan:
+					buffer.WriteString(line)
+					if buffer.Len() > 4096 {
+						var reply []resources.AppendReply
+						_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
+							RemoteName: r.HydfsDestinationFileName,
+							Content:    buffer.Bytes(),
+						}, &reply)
+						buffer.Reset()
+					}
+				}
 			}
 		}()
 
