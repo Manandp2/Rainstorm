@@ -16,7 +16,7 @@ func main() {
 	for scanner.Scan() {
 		text := scanner.Text()
 		if strings.Contains(text, pattern) {
-			fmt.Println(scanner.Text() + "\n")
+			fmt.Println(scanner.Text())
 		}
 	}
 }
