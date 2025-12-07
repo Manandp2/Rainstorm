@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	. "g14-mp4/RainStorm/resources"
 	"g14-mp4/mp3/resources"
@@ -40,6 +41,7 @@ type RainStorm struct {
 	DoneReading              bool
 	StartTime                time.Time
 	LogFile                  *os.File
+	LogFileChan              chan string
 }
 
 const clientTimeout = time.Second * 3
@@ -57,6 +59,7 @@ func main() {
 	dataDir = filepath.Join(homeDir, "data")
 	workers = WorkerIps{}
 	appCompletedChan = make(chan bool, 1)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
 		err := rpc.Register(&workers)
@@ -84,6 +87,16 @@ func main() {
 		if numWorkers == 0 {
 			panic("No workers")
 		}
+
+		r.LogFileChan = make(chan string, 100)
+		r.StartTime = time.Now()
+
+		//logger
+		go func() {
+			path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.Format("20060102150405"))
+			r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+			_, _ = r.LogFile.WriteString("Started RainStorm Application\n")
+		}()
 		// INITIATE NEW RAINSTORM APPLICATION
 		//Global RM
 		/*
@@ -137,10 +150,6 @@ func main() {
 
 		r.Lock = new(sync.RWMutex)
 		r.Lock.Lock()
-		r.StartTime = time.Now()
-		path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.String())
-		r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-		_, _ = r.LogFile.WriteString("Started RainStorm Application\n")
 		r.TaskInformation = make([]map[int]*TaskInfo, r.NumStages)
 		r.NextTaskNum = make([]int, r.NumStages)
 		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
@@ -179,6 +188,7 @@ func main() {
 			fmt.Println("Unable to open src directory: " + err.Error())
 		}
 
+		// reading src file and sending lines to tasks
 		go func() {
 			scanner := bufio.NewScanner(inputFile)
 			r.Lock.Lock()
@@ -341,9 +351,12 @@ func main() {
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
 		<-appCompletedChan //blocking
 		println("RainStorm Application completed!")
+		cancel()
 		r.Lock.Lock()
-		_, _ = r.LogFile.WriteString("Finsihed Rainstorm Application\n")
+		r.LogFileLock.Lock()
+		_, _ = r.LogFile.WriteString("Finished Rainstorm Application\n")
 		_ = r.LogFile.Close()
+		r.LogFileLock.Unlock()
 		r.Lock.Unlock()
 		// CLEANUP: do once the current RainStorm application is done
 		// @TODO: add cleanup for client connections when sending tuples
@@ -387,6 +400,9 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 			}
 			app.Stage1UpdatesChan <- temp
 		}
+		app.LogFileLock.Lock()
+		_, _ = fmt.Fprintf(app.LogFile, "Restarting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), reply, string(app.Ops[task.Stage].Name))
+		app.LogFileLock.Unlock()
 		app.addTask(task.Stage, task.TaskNumber)
 		app.sendIps()
 	}
@@ -401,12 +417,18 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 			app.Lock.Lock()
 			taskNum := app.NextTaskNum[args.Stage]
 			app.NextTaskNum[args.Stage]++
+			app.LogFileLock.Lock()
+			_, _ = fmt.Fprintf(app.LogFile, "Upscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
+			app.LogFileLock.Unlock()
 			app.addTask(args.Stage, taskNum)
 			app.sendIps()
 			app.Lock.Unlock()
 		} else if args.Rate > app.HighestRate {
 			//	remove a task from this stage
 			app.Lock.Lock()
+			app.LogFileLock.Lock()
+			_, _ = fmt.Fprintf(app.LogFile, "Downscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
+			app.LogFileLock.Unlock()
 			app.removeTask(args.Stage)
 			app.Lock.Unlock()
 		}
@@ -420,6 +442,10 @@ func (app *RainStorm) ReceiveTaskCompletion(args TaskID, reply *int) error {
 	defer app.Lock.Unlock()
 	if _, exists := app.TaskInformation[args.Stage][args.Task]; exists {
 		delete(app.TaskInformation[args.Stage], args.Task)
+		app.LogFileLock.Lock()
+		_, _ = fmt.Fprintf(app.LogFile, "Task Completed TaskID: %d Stage: %dVM: %s PID: %d op_exe: %s\n", args.Task, args.Stage, app.TaskInformation[args.Stage][args.Task].Ip.String(), reply, string(app.Ops[args.Stage].Name))
+		app.LogFileLock.Unlock()
+
 		//app.CurNumTasks[args.Stage] -= 1
 		app.sendIps()
 		if len(app.TaskInformation[args.Stage]) == 0 {
@@ -505,7 +531,7 @@ func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN 
 	//	app.TaskInformation[stageNum][taskNum] = workers.ips[app.NextAvailableVM%numWorkers]
 	//}
 	workers.l.RLock()
-	app.TaskInformation[stageNum][taskNum] = TaskInfo{Ip: workers.ips[app.NextAvailableVM%numWorkers]}
+	app.TaskInformation[stageNum][taskNum] = &TaskInfo{Ip: workers.ips[app.NextAvailableVM%numWorkers]}
 	workers.l.RUnlock()
 	//app.TaskCompletion[stageNum].StateTracker[taskNum] = false
 	//app.NextTaskNum[stageNum]++
@@ -532,6 +558,10 @@ func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN 
 		fmt.Println("Failed to send request to add task: " + err.Error())
 	}
 	app.TaskInformation[stageNum][taskNum].Pid = reply
+	//@TODO: also log the local logfile on the task
+	app.LogFileLock.Lock()
+	_, _ = fmt.Fprintf(app.LogFile, "Starting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[stageNum][taskNum].Ip.String(), reply, string(app.Ops[stageNum].Name))
+	app.LogFileLock.Unlock()
 }
 
 func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
@@ -540,7 +570,7 @@ func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK W
 	}
 	var taskNum int
 	for k := range app.TaskInformation[stageNum] {
-		// getting first taskNum when iterating to remove
+		// getting first taskNum when iterating to remove; randomized because of GO
 		taskNum = k
 		break
 	}
@@ -555,7 +585,7 @@ func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK W
 	if stageNum == 0 && !app.DoneReading {
 		temp := make(map[int]net.IP)
 		for task, ip := range app.TaskInformation[0] {
-			temp[task] = ip
+			temp[task] = ip.Ip
 		}
 		app.Stage1UpdatesChan <- temp
 	}
@@ -568,7 +598,7 @@ func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK W
 	}
 	var reply int
 	rpcWorkersLock.RLock()
-	rpcWorker := rpcWorkers[deletedTaskIp.String()]
+	rpcWorker := rpcWorkers[deletedTaskIp.Ip.String()]
 	rpcWorkersLock.RUnlock()
 	err := rpcWorker.Call("Worker.AutoscaleDown", task, &reply)
 	if err != nil {
