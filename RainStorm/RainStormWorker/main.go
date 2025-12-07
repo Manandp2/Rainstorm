@@ -282,7 +282,7 @@ func main() {
 
 		// Local Resource Manager
 		go func() {
-			ticker := time.NewTicker(3 * time.Second)
+			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 
 			for {
