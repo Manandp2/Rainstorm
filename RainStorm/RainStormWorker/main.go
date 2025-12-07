@@ -34,6 +34,12 @@ type taskOutput struct {
 	taskId  TaskID
 	output  string
 }
+
+type logRequest struct {
+	fileName string
+	data     string
+}
+
 type Worker struct {
 	rainStormLeader    *rpc.Client // used to send task completions
 	rainStormStartTime string
@@ -49,6 +55,7 @@ type Worker struct {
 	ips           []map[int]net.IP // ips of machines with [stage][task] indexing
 	taskIDLocker  sync.RWMutex
 	sortedTaskIDs [][]int // used to find the task # within a given stage
+	logChan       chan logRequest
 
 	taskOutputs     chan taskOutput
 	connections     map[string]*WorkerClient
@@ -65,6 +72,7 @@ const ACK = "ACK"
 func main() {
 	leader, err := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+IntroducePort)
 	if err != nil {
+		fmt.Println(err)
 		return
 	}
 	var reply int
@@ -82,6 +90,7 @@ func main() {
 	for {
 		server := rpc.NewServer()
 		if err != nil {
+			time.Sleep(1 * time.Second)
 			continue // try again
 		}
 		worker := Worker{
@@ -91,10 +100,12 @@ func main() {
 			taskOutputs:    make(chan taskOutput, 100),
 			connections:    make(map[string]*WorkerClient),
 			receivedTuples: make(map[string]bool),
+			logChan:        make(chan logRequest, 1000),
 		}
 		err = server.Register(&worker)
 		if err != nil {
-			return
+			time.Sleep(1 * time.Second)
+			continue
 		}
 		leaderListener, err := net.Listen("tcp", AssignmentPort)
 		if err != nil {
@@ -110,11 +121,15 @@ func main() {
 				// On output of tuple from a task, send it to the next task
 				out := <-worker.taskOutputs
 				nextStage := out.taskId.Stage + 1
-				var r []resources.AppendReply
-				worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
-					RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
-					Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
-				}, &r, nil)
+				//var r []resources.AppendReply
+				//worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+				//	RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
+				//	Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
+				//}, &r, nil)
+				worker.logChan <- logRequest{
+					fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
+					data:     fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output),
+				}
 				if nextStage < len(worker.ips) { // send it to the next stage
 					key := out.output
 					if worker.stageOperations[nextStage].Name == AggregateByKey {
@@ -270,11 +285,15 @@ func main() {
 						if err != nil {
 							continue
 						}
-						var r []resources.AppendReply
-						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
-							RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
-							Content:    []byte(fmt.Sprintf("RECEIVED,%s,%s\n", split[0], split[3])),
-						}, &r, nil)
+						//var r []resources.AppendReply
+						//worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+						//	RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
+						//	Content:    []byte(fmt.Sprintf("RECEIVED,%s,%s\n", split[0], split[3])),
+						//}, &r, nil)
+						worker.logChan <- logRequest{
+							fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, stage, task),
+							data:     fmt.Sprintf("RECEIVED,%s,%s", split[0], split[3]),
+						}
 					}
 				}(conn)
 			}
@@ -282,7 +301,7 @@ func main() {
 
 		// Local Resource Manager
 		go func() {
-			ticker := time.NewTicker(3 * time.Second)
+			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 
 			for {
@@ -314,18 +333,67 @@ func main() {
 						task.lastCheckTime = now
 						task.lastInputCount = task.inputRate
 
-						// Check Watermarks
-						if rate < worker.lowWatermark || rate > worker.highWatermark {
-							var r int
-							worker.rainStormLeader.Go("RainStorm.ReceiveRateUpdate", RmUpdate{
-								Stage: t.Stage,
-								Rate:  rate,
-								Task:  t.Task,
-							}, &r, nil)
-						}
+						// Send rate update to leader
+						var r int
+						worker.rainStormLeader.Go("RainStorm.ReceiveRateUpdate", RmUpdate{
+							Stage: t.Stage,
+							Rate:  rate,
+							Task:  t.Task,
+						}, &r, nil)
 					}
 				}
 				worker.tasksLocker.RUnlock()
+			}
+		}()
+
+		// Goroutine for writing to log files
+		go func() {
+			// Map to buffer data for each file: map[filename]*bytes.Buffer
+			buffers := make(map[string]*bytes.Buffer)
+			ticker := time.Tick(500 * time.Millisecond) // Flush interval
+
+			for {
+				select {
+				case <-ticker:
+					for name, buf := range buffers {
+						if buf.Len() > 0 {
+							var r []resources.AppendReply
+							// Copy data to avoid race conditions during reset
+							data := make([]byte, buf.Len())
+							copy(data, buf.Bytes())
+
+							// Async RPC to append the batch
+							worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+								RemoteName: name,
+								Content:    data,
+							}, &r, nil)
+
+							// Clear the buffer
+							buf.Reset()
+						}
+					}
+				case req := <-worker.logChan:
+					// Get or create a buffer for this specific file
+					buf, ok := buffers[req.fileName]
+					if !ok {
+						buf = new(bytes.Buffer)
+						buffers[req.fileName] = buf
+					}
+					// Add the log line to the buffer
+					buf.WriteString(req.data)
+
+					// Optimization: If a buffer gets too big (e.g., 10KB), flush immediately
+					if buf.Len() > 10240 {
+						var r []resources.AppendReply
+						data := make([]byte, buf.Len())
+						copy(data, buf.Bytes())
+						worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
+							RemoteName: req.fileName,
+							Content:    data,
+						}, &r, nil)
+						buf.Reset()
+					}
+				}
 			}
 		}()
 
@@ -461,7 +529,9 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			fmt.Printf("Task %v failed: %v\n", t, err)
 		}
 		w.tasksLocker.Lock()
-		delete(w.tasks, t)
+		if storedTask, ok := w.tasks[t]; ok && storedTask.cmd == task {
+			delete(w.tasks, t)
+		}
 		w.tasksLocker.Unlock()
 	}(taskStdout, tId, w.taskOutputs, task)
 
@@ -530,11 +600,12 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			}
 		}
 	}
-
+	*reply = task.Process.Pid
 	return nil
 }
 
 func (w *Worker) KillTask(t Task, reply *int) error {
+	// TODO: use PID
 	w.tasksLocker.Lock()
 	defer w.tasksLocker.Unlock()
 	id := taskToTaskId(t)
