@@ -30,5 +30,6 @@ func main() {
 		}
 
 		_ = writer.Write(output)
+		writer.Flush()
 	}
 }
