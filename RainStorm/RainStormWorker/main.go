@@ -294,11 +294,15 @@ func main() {
 
 						// write to task
 						worker.tasksLocker.Lock()
-						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
-						if worker.tasks[targetTask].inputRate == 0 {
-							worker.tasks[targetTask].startTime = time.Now()
+						if t, ok := worker.tasks[targetTask]; ok && t.input != nil {
+							_, err = io.WriteString(t.input, split[3])
+							if worker.tasks[targetTask].inputRate == 0 {
+								worker.tasks[targetTask].startTime = time.Now()
+							}
+							worker.tasks[targetTask].inputRate++
+						} else {
+							err = errors.New("pipe close")
 						}
-						worker.tasks[targetTask].inputRate++
 						worker.tasksLocker.Unlock()
 						if err != nil {
 							continue // we weren't able to write, so no ack
@@ -561,7 +565,6 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 
 		if scanner.Err() != nil {
 			fmt.Println("Scanner error:", scanner.Err())
-			return
 		}
 
 		err = cmd.Wait()
@@ -656,16 +659,17 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 	return nil
 }
 
-func (w *Worker) KillTask(t Task, reply *int) error {
-	// TODO: use PID
+func (w *Worker) KillTask(t TaskID, reply *int) error {
 	w.tasksLocker.Lock()
 	defer w.tasksLocker.Unlock()
-	id := taskToTaskId(t)
-	task, ok := w.tasks[id]
+	task, ok := w.tasks[t]
+	fmt.Println("Received kill task")
 	if ok {
+		fmt.Printf("Killing task: %v\n", task)
 		_ = task.cmd.Process.Kill()
 		_ = task.input.Close()
 		_ = task.output.Close()
+		delete(w.tasks, t)
 	}
 	return nil
 }
