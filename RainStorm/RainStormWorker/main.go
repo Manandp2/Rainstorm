@@ -230,25 +230,22 @@ func main() {
 		}()
 
 		// Goroutine for reading in tuples
-		go func() {
-			tupleListener, err := net.Listen("tcp", TuplePort)
-			if err != nil {
-				return
-			}
-			defer func(tupleListener net.Listener) {
-				_ = tupleListener.Close()
-			}(tupleListener)
-
+		tupleListener, err := net.Listen("tcp", TuplePort)
+		if err != nil {
+			return
+		}
+		go func(listener net.Listener) {
 			for {
-				conn, err := tupleListener.Accept()
+				conn, err := listener.Accept()
 				if err != nil {
-					continue
+					return
 				}
 				go func(conn net.Conn) {
 					defer conn.Close()
 					reader := bufio.NewReader(conn)
 					for {
 						tuple, err := reader.ReadString('\n')
+						fmt.Print(tuple)
 						if err != nil {
 							return // connection closed/failed
 						}
@@ -314,7 +311,7 @@ func main() {
 					}
 				}(conn)
 			}
-		}()
+		}(tupleListener)
 
 		// Local Resource Manager
 		go func() {
@@ -417,6 +414,7 @@ func main() {
 		_ = leaderListener.Close()
 		_ = worker.rainStormLeader.Close()
 		_ = worker.tupleSendConn.Close()
+		_ = tupleListener.Close()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
 	}
 
@@ -475,6 +473,7 @@ func (w *Worker) Initialize(args InitArgs, reply *int) error {
 		fmt.Println(err)
 	}
 	w.tupleSendConn = tupleSendConn
+	fmt.Println("Started Rainstorm task")
 	return nil
 }
 
