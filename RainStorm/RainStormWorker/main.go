@@ -125,11 +125,6 @@ func main() {
 				// On output of tuple from a task, send it to the next task
 				out := <-worker.taskOutputs
 				nextStage := out.taskId.Stage + 1
-				//var r []resources.AppendReply
-				//worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
-				//	RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
-				//	Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
-				//}, &r, nil)
 				// Remote log
 				worker.logChan <- logRequest{
 					fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
@@ -219,14 +214,17 @@ func main() {
 					}
 				} else { // output data to the distributed file system
 					// Send the tuple to the leader, they will write to HyDFS
-					_, _ = fmt.Fprintf(worker.tupleSendConn, "%d,%s", out.taskId.Task, out.output)
-					//var r []resources.AppendReply
-					//worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
-					//	RemoteName: worker.hydfsDestFile,
-					//	Content:    []byte(out.output),
-					//}, &r, nil)
-					//
-					//fmt.Println(out.output)
+					if worker.tupleSendConn == nil {
+						fmt.Println("CRITICAL ERROR: tupleSendConn is nil! Initialize hasn't run yet.")
+						worker.taskOutputs <- out          // Re-queue the tuple so it isn't lost
+						time.Sleep(100 * time.Millisecond) // Wait for Initialize
+						continue
+					}
+					_, err = fmt.Fprintln(worker.tupleSendConn, out.output)
+					if err != nil {
+						fmt.Println("error sending tuple to leader", err)
+						worker.taskOutputs <- out // Re-queue the tuple so it isn't lost
+					}
 				}
 			}
 		}()
