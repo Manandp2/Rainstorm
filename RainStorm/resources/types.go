@@ -16,9 +16,9 @@ const AckPort = ":8024"
 type OperationName string
 
 const (
-	Transform      OperationName = "Operation1"
-	Filter         OperationName = "Operation2"
-	AggregateByKey OperationName = "Operation3"
+	Transform      OperationName = "Transform"
+	Filter         OperationName = "Filter"
+	AggregateByKey OperationName = "AggregateByKey"
 )
 
 type Operation struct {
