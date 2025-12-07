@@ -455,8 +455,8 @@ func (app *RainStorm) ReceiveTaskCompletion(args TaskID, reply *int) error {
 	app.Lock.Lock()
 	defer app.Lock.Unlock()
 	if _, exists := app.TaskInformation[args.Stage][args.Task]; exists {
-		delete(app.TaskInformation[args.Stage], args.Task)
 		app.LogFileChan <- fmt.Sprintf("Task Completed TaskID: %d Stage: %dVM: %s PID: %d op_exe: %s\n", args.Task, args.Stage, app.TaskInformation[args.Stage][args.Task].Ip.String(), reply, string(app.Ops[args.Stage].Name))
+		delete(app.TaskInformation[args.Stage], args.Task)
 		//app.CurNumTasks[args.Stage] -= 1
 		app.sendIps()
 		if len(app.TaskInformation[args.Stage]) == 0 {
