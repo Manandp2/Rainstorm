@@ -51,6 +51,11 @@ type WorkerClient struct {
 	Buf  *bufio.Reader
 }
 
+type TaskInfo struct {
+	Ip  net.IP
+	Pid int
+}
+
 type TaskID struct {
 	Stage int
 	Task  int
