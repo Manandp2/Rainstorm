@@ -67,6 +67,7 @@ type Worker struct {
 
 	tuplesLock     sync.Mutex
 	receivedTuples map[string]bool // key = taskId-TupleId, value is dummy
+	tupleSendConn  net.Conn
 }
 
 const clientTimeout = time.Second * 3
@@ -117,7 +118,7 @@ func main() {
 			continue
 		}
 		go server.Accept(leaderListener)
-		tupleSendConn, err := net.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+TuplePort)
+
 		// Goroutine for sending out tuples
 		go func() {
 			for {
@@ -218,7 +219,7 @@ func main() {
 					}
 				} else { // output data to the distributed file system
 					// Send the tuple to the leader, they will write to HyDFS
-					_, _ = fmt.Fprintf(tupleSendConn, "%d,%s", out.taskId.Task, out.output)
+					_, _ = fmt.Fprintf(worker.tupleSendConn, "%d,%s", out.taskId.Task, out.output)
 					//var r []resources.AppendReply
 					//worker.hydfsClient.Go("Client.RemoteAppend", &resources.RemoteFileArgs{
 					//	RemoteName: worker.hydfsDestFile,
@@ -417,7 +418,7 @@ func main() {
 		println("This job finished")
 		_ = leaderListener.Close()
 		_ = worker.rainStormLeader.Close()
-		_ = tupleSendConn.Close()
+		_ = worker.tupleSendConn.Close()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
 	}
 
@@ -471,6 +472,11 @@ func (w *Worker) Initialize(args InitArgs, reply *int) error {
 	w.highWatermark = args.HighWatermark
 	rainStormLeader, _ := rpc.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+GlobalRMPort)
 	w.rainStormLeader = rainStormLeader
+	tupleSendConn, err := net.Dial("tcp", "fa25-cs425-1401.cs.illinois.edu"+TuplePort)
+	if err != nil {
+		fmt.Println(err)
+	}
+	w.tupleSendConn = tupleSendConn
 	return nil
 }
 
