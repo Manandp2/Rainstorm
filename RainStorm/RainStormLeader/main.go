@@ -98,20 +98,24 @@ func main() {
 		//logger
 		go func() {
 			path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.Format("20060102150405"))
+			_ = os.MkdirAll(filepath.Join(homeDir, "RainStormLogs"), 0755)
 			r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 			_, _ = r.LogFile.WriteString("Started RainStorm Application\n")
 			writer := bufio.NewWriter(r.LogFile)
+			defer func() {
+				writer.Flush()
+				r.LogFile.Close()
+			}()
 			for {
 				select {
 				case <-ctx.Done():
-					writer.WriteString("RainStorm Application Completed")
-					writer.Flush()
-					_ = r.LogFile.Close()
+					writer.WriteString("RainStorm Application Completed\n")
 					return
 				case s, ok := <-r.LogFileChan:
 					if !ok {
 						//channel closed
-						continue
+						writer.WriteString("RainStorm Application Completed\n")
+						return
 					}
 					writer.WriteString(s)
 					writer.Flush()
@@ -209,11 +213,11 @@ func main() {
 			fmt.Println("Unable to open src directory: " + err.Error())
 		}
 		//buffered write to HyDFS output file
-		readingChan := make(chan string, 200)
+		outputChan := make(chan string, 200)
 		go func() {
 			buffer := make([]byte, 4096)
 			for {
-				line := <-readingChan
+				line := <-outputChan
 				buffer = append(buffer, []byte(line)...)
 				var reply []resources.AppendReply
 				_ = hydfsClient.Call("Client.RemoteAppend", &resources.RemoteFileArgs{
@@ -248,7 +252,7 @@ func main() {
 									return // connection closed/failed
 								}
 								fmt.Println(line)
-								readingChan <- line
+								outputChan <- line
 							}
 						}
 					}(conn)
@@ -370,7 +374,6 @@ func main() {
 			for _, c := range tupleClients {
 				c.Conn.Close()
 			}
-			println("done closing conns")
 			_ = inputFile.Close()
 		}()
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
