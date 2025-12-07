@@ -55,7 +55,7 @@ type Worker struct {
 	tasksLocker sync.RWMutex
 	tasks       map[TaskID]*localTask
 
-	ips           []map[int]net.IP // ips of machines with [stage][task] indexing
+	ips           []map[int]*TaskInfo // ips of machines with [stage][task] indexing
 	taskIDLocker  sync.RWMutex
 	sortedTaskIDs [][]int // used to find the task # within a given stage
 	logChan       chan logRequest
@@ -165,7 +165,7 @@ func main() {
 					}
 					nextTask := nextStageTasks[hash%len(nextStageTasks)] // Go to the sorted array and find the task #
 
-					nextWorker := worker.ips[nextStage][nextTask].String()
+					nextWorker := worker.ips[nextStage][nextTask].Ip.String()
 					worker.taskIDLocker.RUnlock()
 
 					worker.connectionsLock.RLock()
@@ -480,7 +480,7 @@ func (w *Worker) Initialize(args InitArgs, reply *int) error {
 	return nil
 }
 
-func (w *Worker) ReceiveIPs(ips []map[int]net.IP, reply *int) error {
+func (w *Worker) ReceiveIPs(ips []map[int]*TaskInfo, reply *int) error {
 	w.taskIDLocker.Lock()
 	defer w.taskIDLocker.Unlock()
 
