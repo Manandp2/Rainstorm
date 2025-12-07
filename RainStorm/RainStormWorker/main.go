@@ -11,7 +11,9 @@ import (
 	"io"
 	"net"
 	"net/rpc"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +29,7 @@ type localTask struct {
 	startTime      time.Time
 	lastCheckTime  time.Time
 	lastInputCount int
+	logFile        *os.File
 }
 
 type taskOutput struct {
@@ -126,10 +129,18 @@ func main() {
 				//	RemoteName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
 				//	Content:    []byte(fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output)),
 				//}, &r, nil)
+				// Remote log
 				worker.logChan <- logRequest{
 					fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
 					data:     fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output),
 				}
+
+				// local log
+				worker.tasksLocker.RLock()
+				if t, ok := worker.tasks[out.taskId]; ok && t.logFile != nil {
+					_, _ = fmt.Fprintln(t.logFile, "OUTPUT: ", out.output)
+				}
+				worker.tasksLocker.RUnlock()
 				if nextStage < len(worker.ips) { // send it to the next stage
 					key := out.output
 					if worker.stageOperations[nextStage].Name == AggregateByKey {
@@ -244,18 +255,6 @@ func main() {
 						}
 						split := strings.SplitN(tuple, ",", 4)
 
-						// De-duplication
-						worker.tuplesLock.Lock()
-						if _, ok := worker.receivedTuples[split[0]]; ok {
-							// We have already received this tuple, send an ack back
-							ackMsg := fmt.Sprintf("%s-%s\n", split[0], ACK)
-							_, _ = fmt.Fprintf(conn, ackMsg)
-							continue
-						} else {
-							worker.receivedTuples[split[0]] = true
-						}
-						worker.tuplesLock.Unlock()
-
 						// find the correct task
 						stage, err := strconv.Atoi(split[1])
 						if err != nil {
@@ -265,9 +264,28 @@ func main() {
 						if err != nil {
 							continue
 						}
+						targetTask := TaskID{Stage: stage, Task: task}
+
+						// De-duplication
+						worker.tuplesLock.Lock()
+						if _, ok := worker.receivedTuples[split[0]]; ok {
+							// Log rejection
+							worker.tasksLocker.RLock()
+							if t, ok := worker.tasks[targetTask]; ok && t.logFile != nil {
+								_, _ = fmt.Fprintln(t.logFile, "REJECTED (Duplicate):", split[0])
+							}
+							worker.tasksLocker.RUnlock()
+
+							// We have already received this tuple, send an ack back
+							ackMsg := fmt.Sprintf("%s-%s\n", split[0], ACK)
+							_, _ = fmt.Fprintf(conn, ackMsg)
+							continue
+						} else {
+							worker.receivedTuples[split[0]] = true
+						}
+						worker.tuplesLock.Unlock()
 
 						// write to task
-						targetTask := TaskID{Stage: stage, Task: task}
 						worker.tasksLocker.Lock()
 						_, err = io.WriteString(worker.tasks[targetTask].input, split[3])
 						if worker.tasks[targetTask].inputRate == 0 {
@@ -301,11 +319,10 @@ func main() {
 
 		// Local Resource Manager
 		go func() {
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
+			ticker := time.Tick(time.Second)
 
 			for {
-				<-ticker.C
+				<-ticker
 				worker.tasksLocker.RLock()
 				for t, task := range worker.tasks {
 
@@ -381,8 +398,7 @@ func main() {
 					}
 					// Add the log line to the buffer
 					buf.WriteString(req.data)
-
-					// Optimization: If a buffer gets too big (e.g., 10KB), flush immediately
+					// Flush when the buffer gets too big
 					if buf.Len() > 10240 {
 						var r []resources.AppendReply
 						data := make([]byte, buf.Len())
@@ -494,6 +510,14 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 	if err != nil {
 		return err
 	}
+	homeDir, _ := os.UserHomeDir()
+	logDir := filepath.Join(homeDir, "taskLogs")
+	_ = os.MkdirAll(logDir, 0755) // Create dir if missing
+	logFile, err := os.OpenFile(filepath.Join(logDir, fmt.Sprintf("task_%d_%d_%s", t.Stage, t.TaskNumber, time.Now().Format("20060102150405"))), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(logFile, "Starting task:", t.Executable.Name, "with pid: ", task.Process.Pid)
 
 	// Connect the task's pipe to the channel
 	tId := taskToTaskId(t)
@@ -530,6 +554,7 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 		}
 		w.tasksLocker.Lock()
 		if storedTask, ok := w.tasks[t]; ok && storedTask.cmd == task {
+			_ = storedTask.logFile.Close()
 			delete(w.tasks, t)
 		}
 		w.tasksLocker.Unlock()
@@ -538,9 +563,10 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 	// Add the task to the map
 	w.tasksLocker.Lock()
 	w.tasks[tId] = &localTask{
-		cmd:    task,
-		input:  taskStdin,
-		output: taskStdout,
+		cmd:     task,
+		input:   taskStdin,
+		output:  taskStdout,
+		logFile: logFile,
 	}
 	w.tasksLocker.Unlock()
 
