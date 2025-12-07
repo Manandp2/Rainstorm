@@ -403,12 +403,6 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 			replies = append(replies, reply)
 		}
 	}
-
-	// Check if we met the quorum requirement
-	if successfulWrites < numNodesWanted {
-		return replies, fmt.Errorf("failed to achieve quorum: wanted %d, got %d", numNodesWanted, successfulWrites)
-	}
-
 	return replies, nil
 }
 
