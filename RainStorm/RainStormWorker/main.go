@@ -257,7 +257,6 @@ func main() {
 					reader := bufio.NewReader(conn)
 					for {
 						tuple, err := reader.ReadString('\n')
-						fmt.Print(tuple)
 						if err != nil {
 							return // connection closed/failed
 						}
