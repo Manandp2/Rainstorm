@@ -54,6 +54,7 @@ var rpcWorkers map[string]*rpc.Client
 var rpcWorkersLock sync.RWMutex
 var appCompletedChan chan bool
 var dataDir string
+var curApp *RainStorm
 
 func main() {
 	homeDir, _ := os.UserHomeDir()
@@ -85,7 +86,7 @@ func main() {
 		if numWorkers == 0 {
 			panic("No workers")
 		}
-
+		curApp = &r
 		// Context for cancellation (Stops Listeners/Input)
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -179,7 +180,9 @@ func main() {
 		for i := range r.NumStages {
 			r.TaskInformation[i] = make(map[int]*TaskInfo)
 			for j := range r.NumTasksPerStage {
+				println("Reached")
 				r.addTask(i, j)
+				println("Added task done")
 				r.NextTaskNum[i]++
 			}
 		}
@@ -393,7 +396,6 @@ func main() {
 
 		// --- WAIT FOR APP COMPLETION ---
 		<-appCompletedChan
-		fmt.Println("App completed. Cleaning up")
 
 		// 1. Stop Producers (Listeners and Input Reader)
 		cancel()
@@ -416,7 +418,7 @@ func main() {
 		}
 		rpcWorkersLock.Unlock()
 
-		fmt.Println("Cleanup done.")
+		fmt.Println("RainStorm Application completed")
 	}
 }
 
@@ -724,9 +726,44 @@ func processStdin(i1 chan<- RainStorm) {
 
 		case "kill_task":
 			//@TODO: add implementation for this
+			vm := splits[1]
+			pid, _ := strconv.Atoi(splits[2])
+			curApp.Lock.RLock()
+			for stageNum, stage := range curApp.TaskInformation {
+				done := false
+				for taskNum, info := range stage {
+					if vm == info.Ip.String() && pid == info.Pid {
+						rpcWorkersLock.RLock()
+						worker := rpcWorkers[info.Ip.String()]
+						var reply int
+						_ = worker.Call("Worker.KillTask", TaskID{
+							Task:  taskNum,
+							Stage: stageNum,
+						}, &reply)
+						rpcWorkersLock.RUnlock()
+						done = true
+						break
+					}
+				}
+				if done {
+					break
+				}
+			}
+			curApp.Lock.RUnlock()
 			break
 
 		case "list_tasks":
+			//@TODO print local log file for task
+			println("Lsiting tasks")
+			curApp.Lock.RLock()
+			println("readj")
+			for stageNum, stage := range curApp.TaskInformation {
+				for _, info := range stage {
+					fmt.Printf("%s %d %s\n", info.Ip.String(), info.Pid, curApp.Ops[stageNum])
+				}
+			}
+			curApp.Lock.RUnlock()
+			println("Finished")
 			break
 
 		}
