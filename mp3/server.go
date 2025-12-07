@@ -456,15 +456,15 @@ func (s *Server) MergeGivenList(remoteFile *resources.ExportedFile, reply *int) 
 				local = local.Next()
 			} else {
 				//should never be hit
-				fmt.Println("Local Append buffer:")
-				for e := f.file.AppendBuffer.Front(); e != nil; e = e.Next() {
-					fmt.Printf("%+v , \n", e.Value.(resources.AppendBlock).AppendNumber)
-				}
-				fmt.Println("Remote Append buffer:")
-				for _, a := range remoteFile.AppendBuffer {
-					fmt.Printf("%+v , \n", a.AppendNumber)
-				}
-				panic("there was an append missing from primary and successor1, quorum consistency was broken")
+				//fmt.Println("Local Append buffer:")
+				//for e := f.file.AppendBuffer.Front(); e != nil; e = e.Next() {
+				//	fmt.Printf("%+v , \n", e.Value.(resources.AppendBlock).AppendNumber)
+				//}
+				//fmt.Println("Remote Append buffer:")
+				//for _, a := range remoteFile.AppendBuffer {
+				//	fmt.Printf("%+v , \n", a.AppendNumber)
+				//}
+				//panic("there was an append missing from primary and successor1, quorum consistency was broken")
 			}
 		}
 	}
