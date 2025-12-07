@@ -101,7 +101,7 @@ func main() {
 			path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.Format("20060102150405"))
 			_ = os.MkdirAll(filepath.Join(homeDir, "RainStormLogs"), 0755)
 			r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-			_, _ = r.LogFile.WriteString("Started RainStorm Application\n")
+			_, _ = r.LogFile.WriteString(r.StartTime.Format("2006-01-02 15:04:05") + ": Started RainStorm Application\n")
 			writer := bufio.NewWriter(r.LogFile)
 			defer func() {
 				writer.Flush()
@@ -110,15 +110,15 @@ func main() {
 			for {
 				select {
 				case <-ctx.Done():
-					writer.WriteString("RainStorm Application Completed\n")
+					writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": RainStorm Application Completed\n")
 					return
 				case s, ok := <-r.LogFileChan:
 					if !ok {
 						//channel closed
-						writer.WriteString("RainStorm Application Completed\n")
+						writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": RainStorm Application Completed\n")
 						return
 					}
-					writer.WriteString(s)
+					writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": " + s)
 					writer.Flush()
 				}
 			}
@@ -267,7 +267,7 @@ func main() {
 								if err != nil {
 									return // connection closed/failed
 								}
-								fmt.Println(line)
+								fmt.Print(line)
 								outputChan <- line
 							}
 						}
@@ -448,21 +448,21 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 	//@TODO: write to leader logs when receiving a tuple rate
 	//app.LogFile
-	app.LogFileChan <- fmt.Sprintf("Rate: %.2f TaskID: %d Stage %d", args.Rate, args.Task, args.Stage)
+	app.LogFileChan <- fmt.Sprintf("Rate: %.2f TaskID: %d Stage %d\n", args.Rate, args.Task, args.Stage)
 	if app.AutoScale {
 		if args.Rate < app.LowestRate {
 			//	add a task to this stage
 			app.Lock.Lock()
 			taskNum := app.NextTaskNum[args.Stage]
 			app.NextTaskNum[args.Stage]++
-			app.LogFileChan <- fmt.Sprintf("Upscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
+			app.LogFileChan <- fmt.Sprintf("Upscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
 			app.addTask(args.Stage, taskNum)
 			app.sendIps()
 			app.Lock.Unlock()
 		} else if args.Rate > app.HighestRate {
 			//	remove a task from this stage
 			app.Lock.Lock()
-			app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
+			app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
 			app.removeTask(args.Stage)
 			app.Lock.Unlock()
 		}
@@ -475,7 +475,7 @@ func (app *RainStorm) ReceiveTaskCompletion(args TaskID, reply *int) error {
 	app.Lock.Lock()
 	defer app.Lock.Unlock()
 	if _, exists := app.TaskInformation[args.Stage][args.Task]; exists {
-		app.LogFileChan <- fmt.Sprintf("Task Completed TaskID: %d Stage: %dVM: %s PID: %d op_exe: %s\n", args.Task, args.Stage, app.TaskInformation[args.Stage][args.Task].Ip.String(), reply, string(app.Ops[args.Stage].Name))
+		app.LogFileChan <- fmt.Sprintf("Task Completed TaskID: %d Stage: %d VM: %s PID: %d op_exe: %s\n", args.Task, args.Stage, app.TaskInformation[args.Stage][args.Task].Ip.String(), reply, string(app.Ops[args.Stage].Name))
 		delete(app.TaskInformation[args.Stage], args.Task)
 		//app.CurNumTasks[args.Stage] -= 1
 		app.sendIps()
