@@ -96,6 +96,23 @@ func main() {
 			path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.Format("20060102150405"))
 			r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 			_, _ = r.LogFile.WriteString("Started RainStorm Application\n")
+			writer := bufio.NewWriter(r.LogFile)
+			for {
+				select {
+				case <-ctx.Done():
+					writer.WriteString("RainStorm Application Completed")
+					writer.Flush()
+					_ = r.LogFile.Close()
+					return
+				case s, ok := <-r.LogFileChan:
+					if !ok {
+						//channel closed
+						continue
+					}
+					writer.WriteString(s)
+					writer.Flush()
+				}
+			}
 		}()
 		// INITIATE NEW RAINSTORM APPLICATION
 		//Global RM
@@ -351,15 +368,9 @@ func main() {
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
 		<-appCompletedChan //blocking
 		println("RainStorm Application completed!")
-		cancel()
-		r.Lock.Lock()
-		r.LogFileLock.Lock()
-		_, _ = r.LogFile.WriteString("Finished Rainstorm Application\n")
-		_ = r.LogFile.Close()
-		r.LogFileLock.Unlock()
-		r.Lock.Unlock()
 		// CLEANUP: do once the current RainStorm application is done
-		// @TODO: add cleanup for client connections when sending tuples
+		cancel()
+		close(r.LogFileChan)
 		rpcWorkersLock.Lock()
 		for _, worker := range rpcWorkers {
 			_ = worker.Close()
@@ -400,9 +411,7 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 			}
 			app.Stage1UpdatesChan <- temp
 		}
-		app.LogFileLock.Lock()
-		_, _ = fmt.Fprintf(app.LogFile, "Restarting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), reply, string(app.Ops[task.Stage].Name))
-		app.LogFileLock.Unlock()
+		app.LogFileChan <- fmt.Sprintf("Restarting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), reply, string(app.Ops[task.Stage].Name))
 		app.addTask(task.Stage, task.TaskNumber)
 		app.sendIps()
 	}
@@ -417,18 +426,14 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 			app.Lock.Lock()
 			taskNum := app.NextTaskNum[args.Stage]
 			app.NextTaskNum[args.Stage]++
-			app.LogFileLock.Lock()
-			_, _ = fmt.Fprintf(app.LogFile, "Upscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
-			app.LogFileLock.Unlock()
+			app.LogFileChan <- fmt.Sprintf("Upscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
 			app.addTask(args.Stage, taskNum)
 			app.sendIps()
 			app.Lock.Unlock()
 		} else if args.Rate > app.HighestRate {
 			//	remove a task from this stage
 			app.Lock.Lock()
-			app.LogFileLock.Lock()
-			_, _ = fmt.Fprintf(app.LogFile, "Downscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
-			app.LogFileLock.Unlock()
+			app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Rate: %.2f", args.Stage, args.Rate)
 			app.removeTask(args.Stage)
 			app.Lock.Unlock()
 		}
@@ -442,10 +447,7 @@ func (app *RainStorm) ReceiveTaskCompletion(args TaskID, reply *int) error {
 	defer app.Lock.Unlock()
 	if _, exists := app.TaskInformation[args.Stage][args.Task]; exists {
 		delete(app.TaskInformation[args.Stage], args.Task)
-		app.LogFileLock.Lock()
-		_, _ = fmt.Fprintf(app.LogFile, "Task Completed TaskID: %d Stage: %dVM: %s PID: %d op_exe: %s\n", args.Task, args.Stage, app.TaskInformation[args.Stage][args.Task].Ip.String(), reply, string(app.Ops[args.Stage].Name))
-		app.LogFileLock.Unlock()
-
+		app.LogFileChan <- fmt.Sprintf("Task Completed TaskID: %d Stage: %dVM: %s PID: %d op_exe: %s\n", args.Task, args.Stage, app.TaskInformation[args.Stage][args.Task].Ip.String(), reply, string(app.Ops[args.Stage].Name))
 		//app.CurNumTasks[args.Stage] -= 1
 		app.sendIps()
 		if len(app.TaskInformation[args.Stage]) == 0 {
@@ -559,9 +561,7 @@ func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN 
 	}
 	app.TaskInformation[stageNum][taskNum].Pid = reply
 	//@TODO: also log the local logfile on the task
-	app.LogFileLock.Lock()
-	_, _ = fmt.Fprintf(app.LogFile, "Starting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[stageNum][taskNum].Ip.String(), reply, string(app.Ops[stageNum].Name))
-	app.LogFileLock.Unlock()
+	app.LogFileChan <- fmt.Sprintf("Starting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[stageNum][taskNum].Ip.String(), reply, string(app.Ops[stageNum].Name))
 }
 
 func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
