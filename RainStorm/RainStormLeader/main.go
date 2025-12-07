@@ -88,6 +88,7 @@ func main() {
 		if numWorkers == 0 {
 			panic("No workers")
 		}
+		var wg sync.WaitGroup
 
 		r.LogFileChan = make(chan string, 100)
 		r.StartTime = time.Now()
@@ -259,7 +260,9 @@ func main() {
 					if err != nil {
 						continue
 					}
+					wg.Add(1)
 					go func(conn net.Conn) {
+						defer wg.Done()
 						defer conn.Close()
 						reader := bufio.NewReader(conn)
 						for {
@@ -401,6 +404,7 @@ func main() {
 		<-appCompletedChan //blocking
 		println("RainStorm Application completed!")
 		// CLEANUP: do once the current RainStorm application is done
+		wg.Wait()
 		cancel()
 		close(r.LogFileChan)
 		rpcWorkersLock.Lock()
