@@ -60,63 +60,86 @@ func main() {
 	dataDir = filepath.Join(homeDir, "data")
 	workers = WorkerIps{}
 	appCompletedChan = make(chan bool, 1)
-	ctx, cancel := context.WithCancel(context.Background())
 
+	// 1. Start the RPC Server ONCE (outside the loop)
+	// We do not want to re-register "WorkerIps" every time causing "multiple registration" panic
 	go func() {
-		err := rpc.Register(&workers)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
+		_ = rpc.Register(&workers)
 		listener, err := net.Listen("tcp", IntroducePort)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("IntroducePort Error:", err)
 			return
 		}
 		rpc.Accept(listener)
 	}()
+
 	input := make(chan RainStorm)
 	go processStdin(input)
-	hydfsClient, err := rpc.Dial("tcp", "localhost:8011") // connect to our own HydFS client
+
+	// Connect to HyDFS once
+	hydfsClient, err := rpc.Dial("tcp", "localhost:8011")
 	if err != nil {
-		fmt.Println("Failed to connect to HyDFS client from leader: " + err.Error())
+		fmt.Println("Failed to connect to HyDFS client:", err)
 	}
 	defer hydfsClient.Close()
 
 	for {
 		r := <-input
 		if numWorkers == 0 {
-			panic("No workers")
+			panic("No workers available")
 		}
+
+		// Reset State
+		ctx, cancel := context.WithCancel(context.Background())
 		var wg sync.WaitGroup
 
-		r.LogFileChan = make(chan string, 100)
+		r.LogFileChan = make(chan string, 500)
 		r.StartTime = time.Now()
 
+		// --- 1. SETUP LISTENERS ---
 		tupleListener, err := net.Listen("tcp", TuplePort)
 		if err != nil {
-			return
+			fmt.Println("TuplePort bind error:", err)
+			cancel()
+			continue
 		}
-		//logger
+
+		globalRmListener, err := net.Listen("tcp", GlobalRMPort)
+		if err != nil {
+			fmt.Println("GlobalRM bind error:", err)
+			_ = tupleListener.Close()
+			cancel()
+			continue
+		}
+
+		// --- 2. START LOGGER ---
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			path := filepath.Join(homeDir, "RainStormLogs", "RainStorm_"+r.StartTime.Format("20060102150405"))
 			_ = os.MkdirAll(filepath.Join(homeDir, "RainStormLogs"), 0755)
+
 			r.LogFile, _ = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 			_, _ = r.LogFile.WriteString(r.StartTime.Format("2006-01-02 15:04:05") + ": Started RainStorm Application\n")
+
 			writer := bufio.NewWriter(r.LogFile)
 			defer func() {
 				writer.Flush()
 				r.LogFile.Close()
 			}()
+
 			for {
 				select {
 				case <-ctx.Done():
+					// Drain remaining logs
+					for len(r.LogFileChan) > 0 {
+						s := <-r.LogFileChan
+						writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": " + s)
+					}
 					writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": RainStorm Application Completed\n")
 					return
 				case s, ok := <-r.LogFileChan:
 					if !ok {
-						//channel closed
-						writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": RainStorm Application Completed\n")
 						return
 					}
 					writer.WriteString(time.Now().Format("2006-01-02 15:04:05") + ": " + s)
@@ -132,45 +155,35 @@ func main() {
 			3. compare rates to see if changes are needed
 			4. complete changes
 		*/
+		// --- 3. START GLOBAL RM ---
 		appServer := rpc.NewServer()
-		err = appServer.Register(&r)
-		if err != nil {
-			fmt.Println(err)
-			continue
-		}
-		globalRmListener, err := net.Listen("tcp", GlobalRMPort)
-		if err != nil {
-			fmt.Println("GlobalRM unable to connect to worker: " + err.Error())
-			continue
-		}
+		_ = appServer.Register(&r)
+
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+			// Sidecar to close listener on exit, breaking the Accept loop
+			go func() { <-ctx.Done(); globalRmListener.Close() }()
+
 			for {
 				conn, err := globalRmListener.Accept()
 				if err != nil {
-					if strings.Contains(err.Error(), "use of closed network connection") {
-						return // Exit quietly
-					}
-					fmt.Println("GlobalRM Accept error: " + err.Error())
-					return
+					return // Listener closed
 				}
-				//give connection to RPC server
 				go appServer.ServeConn(conn)
 			}
 		}()
 
+		// --- 4. CONNECT TO WORKERS ---
 		workers.l.RLock()
 		rpcWorkers = make(map[string]*rpc.Client)
-		numSuccessfulDials = 0
 		rpcWorkersLock.Lock()
 		for _, workerIp := range workers.ips {
-			//collect list of tasks for this worker
 			worker, err := rpc.Dial("tcp", workerIp.String()+AssignmentPort)
 			if err != nil {
-				fmt.Println("Unable to connect to worker: " + err.Error())
 				continue
 			}
 			rpcWorkers[workerIp.String()] = worker
-			numSuccessfulDials++
 		}
 		workers.l.RUnlock()
 		rpcWorkersLock.Unlock()
@@ -181,15 +194,10 @@ func main() {
 		r.NextTaskNum = make([]int, r.NumStages)
 		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
 		r.DoneReading = false
-		//r.TaskCompletion = make([]CompletionTuple, r.NumStages)
 		r.initWorker()
 		r.NextAvailableVM = 0
 		for i := range r.NumStages {
 			r.TaskInformation[i] = make(map[int]*TaskInfo)
-			//r.TaskCompletion[i] = CompletionTuple{
-			//	Counter:      0,
-			//	StateTracker: make(map[int]bool),
-			//}
 			for j := range r.NumTasksPerStage {
 				r.addTask(i, j)
 				r.NextTaskNum[i]++
@@ -215,9 +223,13 @@ func main() {
 			fmt.Println("Unable to open src directory: " + err.Error())
 		}
 		//buffered write to HyDFS output file
-		outputChan := make(chan string, 200)
+		outputChan := make(chan string, 500)
+
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			buffer := bytes.Buffer{}
+
 			flush := func() {
 				if buffer.Len() > 0 {
 					var reply []resources.AppendReply
@@ -228,16 +240,16 @@ func main() {
 					buffer.Reset()
 				}
 			}
+
 			for {
 				select {
 				case <-ctx.Done():
+					// DRAIN: Write everything remaining in channel
 					for len(outputChan) > 0 {
 						line := <-outputChan
 						buffer.WriteString(line)
 					}
-					if buffer.Len() > 0 {
-						flush()
-					}
+					flush()
 					return
 				case line := <-outputChan:
 					buffer.WriteString(line)
@@ -248,44 +260,61 @@ func main() {
 			}
 		}()
 
-		//listen for tuples to print to console and buffered append to hydfs
+		// --- 7. START TUPLE LISTENER (Output Collector) ---
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+
+			// Sidecar: Close listener when context dies
+			go func() {
+				<-ctx.Done()
+				tupleListener.Close()
+			}()
+
 			for {
-				select {
-				case <-ctx.Done():
-					_ = tupleListener.Close()
+				conn, err := tupleListener.Accept()
+				if err != nil {
 					return
-				default:
-					conn, err := tupleListener.Accept()
-					if err != nil {
-						continue
-					}
-					wg.Add(1)
-					go func(conn net.Conn) {
-						defer wg.Done()
-						defer conn.Close()
-						reader := bufio.NewReader(conn)
-						for {
+				}
+
+				wg.Add(1) // Wait for individual connections
+				go func(c net.Conn) {
+					defer wg.Done()
+					defer c.Close()
+
+					// Connection Sidecar: Force close to unblock ReadString
+					go func() { <-ctx.Done(); c.Close() }()
+
+					reader := bufio.NewReader(c)
+					for {
+						line, err := reader.ReadString('\n')
+						if len(line) > 0 {
+							fmt.Print(line)
+							// Non-blocking send
 							select {
+							case outputChan <- line:
 							case <-ctx.Done():
 								return
-							default:
-								line, err := reader.ReadString('\n')
-								if err != nil {
-									return // connection closed/failed
-								}
-								fmt.Print(line)
-								outputChan <- line
 							}
 						}
-					}(conn)
-				}
+						if err != nil {
+							return
+						}
+					}
+				}(conn)
 			}
 		}()
 
+		//inputFile, _ = os.Open(filepath.Join(dataDir, r.HydfsSrcDirectory))
 		// reading src file and sending lines to tasks
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
+			defer inputFile.Close()
+
 			scanner := bufio.NewScanner(inputFile)
+
+			// ... [Your existing Snapshot Logic Here] ...
 			r.Lock.Lock()
 			firstStageTasks := make(map[int]net.IP)
 			firstTaskList := make([]int, 0)
@@ -295,13 +324,18 @@ func main() {
 			}
 			sort.Ints(firstTaskList)
 			r.Lock.Unlock()
+
 			tupleClients := make(map[string]*WorkerClient, numWorkers)
-			startTime := time.Now()
 			var numProcessed float64 = 0
+			startTime := time.Now() // Local start time for rate limiting
+
+			// Reading Channel
 			readingChan := make(chan struct {
 				line    string
 				lineNum int
 			}, 100)
+
+			// Producer Routine
 			go func() {
 				lineNum := 0
 				for scanner.Scan() {
@@ -315,20 +349,32 @@ func main() {
 					line    string
 					lineNum int
 				}{line: "", lineNum: -1}
+
 				r.Lock.Lock()
 				r.DoneReading = true
 				r.Lock.Unlock()
 			}()
-			eofReceived := false
-			done := false
+
+			// Consumer Routine
 			for {
 				select {
+				case <-ctx.Done():
+					// Cleanup clients
+					for _, c := range tupleClients {
+						c.Conn.Close()
+					}
+					return
+
 				case tuple := <-readingChan:
 					if tuple.lineNum == -1 {
-						//done reading
-						eofReceived = true
-						continue
+						r.sendStageCompletion(-1)
+						for _, c := range tupleClients {
+							c.Conn.Close()
+						}
+						return // Done reading
 					}
+
+					// ... [Update Logic] ...
 					select {
 					case updatedMap := <-r.Stage1UpdatesChan:
 						firstStageTasks = updatedMap
@@ -340,6 +386,14 @@ func main() {
 					default:
 					}
 
+					// ... [Panic Fix] ...
+					if len(firstTaskList) == 0 {
+						time.Sleep(50 * time.Millisecond)
+						readingChan <- tuple
+						continue
+					}
+
+					// ... [Routing Logic] ...
 					nextTask := firstTaskList[tuple.lineNum%len(firstTaskList)]
 					nextTaskIp := firstStageTasks[nextTask]
 
@@ -347,26 +401,23 @@ func main() {
 					if !ok {
 						conn, err := net.Dial("tcp", nextTaskIp.String()+TuplePort)
 						if err != nil {
-							fmt.Println("Unable to connect to worker: " + err.Error())
+							// Retry logic
 							delete(tupleClients, nextTaskIp.String())
 							continue
 						}
-						client = &WorkerClient{
-							Conn: conn,
-							Buf:  bufio.NewReader(conn),
-						}
+						client = &WorkerClient{Conn: conn, Buf: bufio.NewReader(conn)}
 						tupleClients[nextTaskIp.String()] = client
 					}
 
-					// Send the tuple
+					// ... [Sending Logic] ...
 					_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
-					// Id-Id, stage, task, data
 					_, _ = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", "temp", tuple.lineNum, 0, nextTask, tuple.line)
 
-					// Wait for the ack
+					// Wait ACK
 					_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
 					ack, err := client.Buf.ReadString('\n')
 					expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
+
 					if err != nil || strings.TrimSpace(ack) != expectedAck {
 						client.Conn.Close()
 						delete(tupleClients, nextTaskIp.String())
@@ -374,49 +425,33 @@ func main() {
 						continue
 					}
 
+					// Rate Limit
+					numProcessed++
 					expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
 					targetTime := startTime.Add(expectedDuration)
-
-					now := time.Now()
-					if targetTime.After(now) {
-						// ahead of schedule, sleep to sync with desired rate
-						time.Sleep(targetTime.Sub(now))
-					}
-					numProcessed++
-				default:
-					// reached if channel is empty
-					if eofReceived {
-						done = true
+					if targetTime.After(time.Now()) {
+						time.Sleep(targetTime.Sub(time.Now()))
 					}
 				}
-				if done {
-					break
-				}
 			}
-
-			r.sendStageCompletion(-1)
-			for _, c := range tupleClients {
-				c.Conn.Close()
-			}
-			_ = inputFile.Close()
 		}()
 		// needs to wait for the application to complete before cleaning up --> @TODO: come back to this
-		<-appCompletedChan //blocking
-		println("RainStorm Application completed!")
-		// CLEANUP: do once the current RainStorm application is done
-		wg.Wait()
+		// --- 9. WAIT FOR COMPLETION AND CLEANUP ---
+		<-appCompletedChan
+		fmt.Println("App completed Cleaning up")
+
+		// Stop all background routines
 		cancel()
-		close(r.LogFileChan)
+
+		// Wait for Listeners, Writers, Logger to finish
+		wg.Wait()
+
+		// Close workers
 		rpcWorkersLock.Lock()
 		for _, worker := range rpcWorkers {
 			_ = worker.Close()
 		}
 		rpcWorkersLock.Unlock()
-
-		err = globalRmListener.Close()
-		if err != nil {
-			fmt.Println(err)
-		}
 	}
 
 }
