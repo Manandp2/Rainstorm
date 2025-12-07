@@ -330,7 +330,7 @@ func (c *Client) getReplicaNodes(remoteFile string) ([]failureDetector.NodeId, e
 }
 
 func (c *Client) MultiAppend(args resources.MultiAppendArgs, reply *int) error {
-	err := c.addContentAtNodes(args.LocalName, args.RemoteName, 2, appendRpc)
+	err := c.addContentAtNodes(args.LocalName, args.RemoteName, 3, appendRpc)
 	if err != nil {
 		return err
 	}
@@ -387,7 +387,7 @@ func (c *Client) sendDataToNodes(remoteName string, content []byte, numNodesWant
 
 // RemoteAppend is used to append to a file from a remote client
 func (c *Client) RemoteAppend(args *resources.RemoteFileArgs, reply *[]resources.AppendReply) error {
-	responses, err := c.sendDataToNodes(args.RemoteName, args.Content, 2, appendRpc)
+	responses, err := c.sendDataToNodes(args.RemoteName, args.Content, 3, appendRpc)
 	if err != nil {
 		return err
 	}
