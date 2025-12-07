@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -106,6 +107,10 @@ func main() {
 			receivedTuples: make(map[string]bool),
 			logChan:        make(chan logRequest, 1000),
 		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+
 		err = server.Register(&worker)
 		if err != nil {
 			time.Sleep(1 * time.Second)
@@ -120,110 +125,117 @@ func main() {
 		go server.Accept(leaderListener)
 
 		// Goroutine for sending out tuples
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for {
 				// On output of tuple from a task, send it to the next task
-				out := <-worker.taskOutputs
-				nextStage := out.taskId.Stage + 1
-				// Remote log
-				worker.logChan <- logRequest{
-					fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
-					data:     fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output),
-				}
+				select {
+				case <-ctx.Done():
+					return
+				case out := <-worker.taskOutputs:
 
-				// local log
-				worker.tasksLocker.RLock()
-				if t, ok := worker.tasks[out.taskId]; ok && t.logFile != nil {
-					_, _ = fmt.Fprintln(t.logFile, "OUTPUT: ", out.output)
-				}
-				worker.tasksLocker.RUnlock()
-				if nextStage < len(worker.ips) { // send it to the next stage
-					key := out.output
-					if worker.stageOperations[nextStage].Name == AggregateByKey {
-						hashIndex, err := strconv.Atoi(worker.stageOperations[nextStage].Args)
-						if err != nil {
-							hashIndex = 0
-						}
-						reader := csv.NewReader(strings.NewReader(out.output))
-						tuple, err := reader.Read()
-						if err == nil && hashIndex < len(tuple) {
-							key = tuple[hashIndex]
-						}
+					nextStage := out.taskId.Stage + 1
+					// Remote log
+					worker.logChan <- logRequest{
+						fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
+						data:     fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output),
 					}
 
-					// Find which client gets the next tuple
-					worker.taskIDLocker.RLock()
-					nextStageTasks := worker.sortedTaskIDs[nextStage]
-					hash := HashString(key)
-					if hash < 0 { // make sure hash is positive
-						hash = -hash
+					// local log
+					worker.tasksLocker.RLock()
+					if t, ok := worker.tasks[out.taskId]; ok && t.logFile != nil {
+						_, _ = fmt.Fprintln(t.logFile, "OUTPUT: ", out.output)
 					}
-					nextTask := nextStageTasks[hash%len(nextStageTasks)] // Go to the sorted array and find the task #
+					worker.tasksLocker.RUnlock()
+					if nextStage < len(worker.ips) { // send it to the next stage
+						key := out.output
+						if worker.stageOperations[nextStage].Name == AggregateByKey {
+							hashIndex, err := strconv.Atoi(worker.stageOperations[nextStage].Args)
+							if err != nil {
+								hashIndex = 0
+							}
+							reader := csv.NewReader(strings.NewReader(out.output))
+							tuple, err := reader.Read()
+							if err == nil && hashIndex < len(tuple) {
+								key = tuple[hashIndex]
+							}
+						}
 
-					nextWorker := worker.ips[nextStage][nextTask].Ip.String()
-					worker.taskIDLocker.RUnlock()
+						// Find which client gets the next tuple
+						worker.taskIDLocker.RLock()
+						nextStageTasks := worker.sortedTaskIDs[nextStage]
+						hash := HashString(key)
+						if hash < 0 { // make sure hash is positive
+							hash = -hash
+						}
+						nextTask := nextStageTasks[hash%len(nextStageTasks)] // Go to the sorted array and find the task #
 
-					worker.connectionsLock.RLock()
-					client, ok := worker.connections[nextWorker]
-					worker.connectionsLock.RUnlock()
-					if !ok { // new connection,
-						// try connecting
-						conn, err := net.Dial("tcp", nextWorker+TuplePort)
-						if err != nil {
+						nextWorker := worker.ips[nextStage][nextTask].Ip.String()
+						worker.taskIDLocker.RUnlock()
+
+						worker.connectionsLock.RLock()
+						client, ok := worker.connections[nextWorker]
+						worker.connectionsLock.RUnlock()
+						if !ok { // new connection,
+							// try connecting
+							conn, err := net.Dial("tcp", nextWorker+TuplePort)
+							if err != nil {
+								worker.taskOutputs <- out
+								continue
+							}
+							newClient := &WorkerClient{
+								Conn: conn,
+								Buf:  bufio.NewReader(conn),
+							}
+
+							worker.connectionsLock.Lock()
+							// Make sure the client wasn't already added while we were dialing
+							if existing, exists := worker.connections[nextWorker]; exists {
+								// Already exists, just use that one
+								client = existing
+								conn.Close()
+							} else {
+								client = newClient
+								worker.connections[nextWorker] = client
+							}
+							worker.connectionsLock.Unlock()
+						}
+
+						// Send the tuple
+						_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
+						// Id-Id, stage, task, data
+						_, err = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
+
+						if err != nil { // Write didn't go through, disconnect and try again
+							_ = client.Conn.Close()
+							worker.connectionsLock.Lock()
+							delete(worker.connections, nextWorker)
+							worker.connectionsLock.Unlock()
 							worker.taskOutputs <- out
 							continue
 						}
-						newClient := &WorkerClient{
-							Conn: conn,
-							Buf:  bufio.NewReader(conn),
+
+						// Wait for the ack
+						_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
+						ack, err := client.Buf.ReadString('\n')
+						expectedAck := fmt.Sprintf("%s-%d-%s", out.taskId.String(), out.tupleId, ACK)
+						if err != nil || strings.TrimSpace(ack) != expectedAck {
+							worker.taskOutputs <- out // didn't receive the ack, just try again
 						}
-
-						worker.connectionsLock.Lock()
-						// Make sure the client wasn't already added while we were dialing
-						if existing, exists := worker.connections[nextWorker]; exists {
-							// Already exists, just use that one
-							client = existing
-							conn.Close()
-						} else {
-							client = newClient
-							worker.connections[nextWorker] = client
+					} else { // output data to the distributed file system
+						// Send the tuple to the leader, they will write to HyDFS
+						if worker.tupleSendConn == nil {
+							fmt.Println("CRITICAL ERROR: tupleSendConn is nil! Initialize hasn't run yet.")
+							worker.taskOutputs <- out          // Re-queue the tuple so it isn't lost
+							time.Sleep(100 * time.Millisecond) // Wait for Initialize
+							continue
 						}
-						worker.connectionsLock.Unlock()
-					}
-
-					// Send the tuple
-					_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
-					// Id-Id, stage, task, data
-					_, err = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
-
-					if err != nil { // Write didn't go through, disconnect and try again
-						_ = client.Conn.Close()
-						worker.connectionsLock.Lock()
-						delete(worker.connections, nextWorker)
-						worker.connectionsLock.Unlock()
-						worker.taskOutputs <- out
-						continue
-					}
-
-					// Wait for the ack
-					_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
-					ack, err := client.Buf.ReadString('\n')
-					expectedAck := fmt.Sprintf("%s-%d-%s", out.taskId.String(), out.tupleId, ACK)
-					if err != nil || strings.TrimSpace(ack) != expectedAck {
-						worker.taskOutputs <- out // didn't receive the ack, just try again
-					}
-				} else { // output data to the distributed file system
-					// Send the tuple to the leader, they will write to HyDFS
-					if worker.tupleSendConn == nil {
-						fmt.Println("CRITICAL ERROR: tupleSendConn is nil! Initialize hasn't run yet.")
-						worker.taskOutputs <- out          // Re-queue the tuple so it isn't lost
-						time.Sleep(100 * time.Millisecond) // Wait for Initialize
-						continue
-					}
-					_, err = fmt.Fprintln(worker.tupleSendConn, out.output)
-					if err != nil {
-						fmt.Println("error sending tuple to leader", err)
-						worker.taskOutputs <- out // Re-queue the tuple so it isn't lost
+						_, err = fmt.Fprintln(worker.tupleSendConn, out.output)
+						if err != nil {
+							fmt.Println("error sending tuple to leader", err)
+							worker.taskOutputs <- out // Re-queue the tuple so it isn't lost
+						}
 					}
 				}
 			}
@@ -314,60 +326,71 @@ func main() {
 		}(tupleListener)
 
 		// Local Resource Manager
+		wg.Add(1)
 		go func() {
-			ticker := time.Tick(time.Second)
+			defer wg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
 
 			for {
-				<-ticker
-				worker.tasksLocker.RLock()
-				for t, task := range worker.tasks {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					worker.tasksLocker.RLock()
+					for t, task := range worker.tasks {
 
-					if task.startTime.IsZero() {
-						continue
+						if task.startTime.IsZero() {
+							continue
+						}
+
+						// If this is the first check, snapshot the current state and wait for the next tick
+						if task.lastCheckTime.IsZero() {
+							task.lastCheckTime = time.Now()
+							task.lastInputCount = task.inputRate
+							continue
+						}
+
+						// (Current Total - Old Total) / (Now - Old Time)
+						now := time.Now()
+						duration := now.Sub(task.lastCheckTime).Seconds()
+
+						if duration > 0 {
+							// Calculate tuples per second over the last window
+							tuplesReceivedSinceLastTick := float64(task.inputRate - task.lastInputCount)
+							rate := tuplesReceivedSinceLastTick / duration
+
+							// Update snapshot for the next tick
+							task.lastCheckTime = now
+							task.lastInputCount = task.inputRate
+
+							// Send rate update to leader
+							var r int
+							worker.rainStormLeader.Go("RainStorm.ReceiveRateUpdate", RmUpdate{
+								Stage: t.Stage,
+								Rate:  rate,
+								Task:  t.Task,
+							}, &r, nil)
+						}
 					}
-
-					// If this is the first check, snapshot the current state and wait for the next tick
-					if task.lastCheckTime.IsZero() {
-						task.lastCheckTime = time.Now()
-						task.lastInputCount = task.inputRate
-						continue
-					}
-
-					// (Current Total - Old Total) / (Now - Old Time)
-					now := time.Now()
-					duration := now.Sub(task.lastCheckTime).Seconds()
-
-					if duration > 0 {
-						// Calculate tuples per second over the last window
-						tuplesReceivedSinceLastTick := float64(task.inputRate - task.lastInputCount)
-						rate := tuplesReceivedSinceLastTick / duration
-
-						// Update snapshot for the next tick
-						task.lastCheckTime = now
-						task.lastInputCount = task.inputRate
-
-						// Send rate update to leader
-						var r int
-						worker.rainStormLeader.Go("RainStorm.ReceiveRateUpdate", RmUpdate{
-							Stage: t.Stage,
-							Rate:  rate,
-							Task:  t.Task,
-						}, &r, nil)
-					}
+					worker.tasksLocker.RUnlock()
 				}
-				worker.tasksLocker.RUnlock()
 			}
 		}()
 
 		// Goroutine for writing to log files
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			// Map to buffer data for each file: map[filename]*bytes.Buffer
 			buffers := make(map[string]*bytes.Buffer)
-			ticker := time.Tick(500 * time.Millisecond) // Flush interval
-
+			ticker := time.NewTicker(500 * time.Millisecond) // Flush interval
+			defer ticker.Stop()
 			for {
 				select {
-				case <-ticker:
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
 					for name, buf := range buffers {
 						if buf.Len() > 0 {
 							var r []resources.AppendReply
@@ -408,13 +431,14 @@ func main() {
 				}
 			}
 		}()
-
 		<-worker.done
 		println("This job finished")
+		cancel()
 		_ = leaderListener.Close()
 		_ = worker.rainStormLeader.Close()
 		_ = worker.tupleSendConn.Close()
 		_ = tupleListener.Close()
+		wg.Wait()
 		time.Sleep(1 * time.Second) // wait for os to release port 8021
 	}
 
