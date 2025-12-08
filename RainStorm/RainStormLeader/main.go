@@ -43,6 +43,7 @@ type RainStorm struct {
 	StartTime                time.Time
 	LogFile                  *os.File
 	LogFileChan              chan string
+	LastAutoscaleTime        map[int]time.Time
 }
 
 const clientTimeout = time.Second * 3
@@ -174,6 +175,12 @@ func main() {
 		r.TaskInformation = make([]map[int]*TaskInfo, r.NumStages)
 		r.NextTaskNum = make([]int, r.NumStages)
 		r.Stage1UpdatesChan = make(chan map[int]net.IP, 20)
+
+		r.LastAutoscaleTime = make(map[int]time.Time)
+		for i := range r.NumStages {
+			r.LastAutoscaleTime[i] = time.Now() // Wait 3s from start before autoscaling
+		}
+
 		r.DoneReading = false
 		r.initWorker()
 		r.NextAvailableVM = 0
@@ -280,7 +287,6 @@ func main() {
 		wgProducers.Add(1)
 		go func() {
 			defer wgProducers.Done()
-			defer inputFile.Close()
 
 			scanner := bufio.NewScanner(inputFile)
 
@@ -311,6 +317,11 @@ func main() {
 						lineNum int
 					}{line: scanner.Text(), lineNum: lineNum}
 					lineNum++
+				}
+				if err := scanner.Err(); err != nil {
+					fmt.Printf("FATAL SCANNER ERROR: %v\n", err)
+				} else {
+					fmt.Printf("Scanner finished. Total lines read: %d\n", lineNum)
 				}
 				readingChan <- struct {
 					line    string
@@ -443,7 +454,7 @@ func main() {
 			_ = worker.Close()
 		}
 		rpcWorkersLock.Unlock()
-
+		inputFile.Close()
 		localOutputFile.Close()
 		fmt.Println("RainStorm Application completed")
 	}
@@ -486,20 +497,34 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 	//app.LogFile
 	app.LogFileChan <- fmt.Sprintf("Rate: %.2f TaskID: %d Stage %d\n", args.Rate, args.Task, args.Stage)
 	if app.AutoScale {
+		if args.Rate <= 0.01 {
+			return nil
+		}
 		if args.Rate < app.LowestRate {
 			//	remove a task from this stage
 			app.Lock.Lock()
-			app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
-			app.removeTask(args.Stage)
+			if time.Since(app.LastAutoscaleTime[args.Stage]) > 3*time.Second {
+				if len(app.TaskInformation[args.Stage]) > 1 {
+					app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Task: %d Rate: %.2f\n", args.Stage, args.Task, args.Rate)
+					fmt.Printf("Downscaling Stage: %d Task: %d Rate: %.2f\n", args.Stage, args.Task, args.Rate)
+					app.removeTask(args.Stage, args.Task)
+					// Reset the timer
+					app.LastAutoscaleTime[args.Stage] = time.Now()
+				}
+			}
 			app.Lock.Unlock()
 		} else if args.Rate > app.HighestRate {
 			//	add a task to this stage
 			app.Lock.Lock()
-			taskNum := app.NextTaskNum[args.Stage]
-			app.NextTaskNum[args.Stage]++
-			app.LogFileChan <- fmt.Sprintf("Upscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
-			app.addTask(args.Stage, taskNum)
-			app.sendIps()
+			if time.Since(app.LastAutoscaleTime[args.Stage]) > 3*time.Second {
+				taskNum := app.NextTaskNum[args.Stage]
+				app.NextTaskNum[args.Stage]++
+				app.LogFileChan <- fmt.Sprintf("Upscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
+				app.addTask(args.Stage, taskNum)
+				app.sendIps()
+				// Reset the timer
+				app.LastAutoscaleTime[args.Stage] = time.Now()
+			}
 			app.Lock.Unlock()
 		}
 	}
@@ -629,16 +654,16 @@ func (app *RainStorm) addTask(stageNum int, taskNum int) { //MUST BE WRAPPED IN 
 	app.LogFileChan <- fmt.Sprintf("Starting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[stageNum][taskNum].Ip.String(), reply, string(app.Ops[stageNum].Name))
 }
 
-func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
+func (app *RainStorm) removeTask(stageNum, taskNum int) { //MUST BE WRAPPED IN APP LOCK WHEN CALLED
 	if len(app.TaskInformation[stageNum]) <= 1 { // only 1 task remaining in the stage
 		return
 	}
-	var taskNum int
-	for k := range app.TaskInformation[stageNum] {
-		// getting first taskNum when iterating to remove; randomized because of GO
-		taskNum = k
-		break
-	}
+	//var taskNum int
+	//for k := range app.TaskInformation[stageNum] {
+	//	// getting first taskNum when iterating to remove; randomized because of GO
+	//	taskNum = k
+	//	break
+	//}
 
 	deletedTaskIp, exists := app.TaskInformation[stageNum][taskNum]
 	if !exists {
@@ -656,19 +681,18 @@ func (app *RainStorm) removeTask(stageNum int) { //MUST BE WRAPPED IN APP LOCK W
 	}
 	app.sendIps()
 
-	task := Task{
-		TaskNumber: taskNum,
-		Stage:      stageNum,
-		Executable: app.Ops[stageNum],
+	task := TaskID{
+		Stage: stageNum,
+		Task:  taskNum,
 	}
 	var reply int
 	rpcWorkersLock.RLock()
 	rpcWorker := rpcWorkers[deletedTaskIp.Ip.String()]
 	rpcWorkersLock.RUnlock()
-	err := rpcWorker.Call("Worker.AutoscaleDown", task, &reply)
-	if err != nil {
-		fmt.Println("Failed to send request to kill task: " + err.Error())
-	}
+	rpcWorker.Go("Worker.AutoscaleDown", task, &reply, nil)
+	//if err != nil {
+	//	fmt.Println("Failed to send request to kill task: " + err.Error())
+	//}
 }
 
 func processStdin(i1 chan<- RainStorm) {
