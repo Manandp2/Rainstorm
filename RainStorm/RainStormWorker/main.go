@@ -69,6 +69,8 @@ type Worker struct {
 	tuplesLock     sync.Mutex
 	receivedTuples map[string]bool // key = taskId-TupleId, value is dummy
 	tupleSendConn  net.Conn
+
+	finishedStages map[int]bool // Add this
 }
 
 const clientTimeout = time.Second * 3
@@ -106,6 +108,7 @@ func main() {
 			connections:    make(map[string]*WorkerClient),
 			receivedTuples: make(map[string]bool),
 			logChan:        make(chan logRequest, 1000),
+			finishedStages: make(map[int]bool),
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -181,7 +184,10 @@ func main() {
 							// try connecting
 							conn, err := net.Dial("tcp", nextWorker+TuplePort)
 							if err != nil {
-								worker.taskOutputs <- out
+								go func(t taskOutput) {
+									time.Sleep(100 * time.Millisecond) // Wait a bit
+									worker.taskOutputs <- t
+								}(out)
 								continue
 							}
 							newClient := &WorkerClient{
@@ -212,7 +218,10 @@ func main() {
 							worker.connectionsLock.Lock()
 							delete(worker.connections, nextWorker)
 							worker.connectionsLock.Unlock()
-							worker.taskOutputs <- out
+							go func(t taskOutput) {
+								time.Sleep(100 * time.Millisecond) // Wait a bit
+								worker.taskOutputs <- t
+							}(out)
 							continue
 						}
 
@@ -221,20 +230,29 @@ func main() {
 						ack, err := client.Buf.ReadString('\n')
 						expectedAck := fmt.Sprintf("%s-%d-%s", out.taskId.String(), out.tupleId, ACK)
 						if err != nil || strings.TrimSpace(ack) != expectedAck {
-							worker.taskOutputs <- out // didn't receive the ack, just try again
+							go func(t taskOutput) {
+								time.Sleep(100 * time.Millisecond) // Wait a bit
+								worker.taskOutputs <- t
+							}(out) // didn't receive the ack, just try again
 						}
 					} else { // output data to the distributed file system
 						// Send the tuple to the leader, they will write to HyDFS
 						if worker.tupleSendConn == nil {
 							fmt.Println("CRITICAL ERROR: tupleSendConn is nil! Initialize hasn't run yet.")
-							worker.taskOutputs <- out          // Re-queue the tuple so it isn't lost
+							go func(t taskOutput) {
+								time.Sleep(100 * time.Millisecond) // Wait a bit
+								worker.taskOutputs <- t
+							}(out) // Re-queue the tuple so it isn't lost
 							time.Sleep(100 * time.Millisecond) // Wait for Initialize
 							continue
 						}
 						_, err = fmt.Fprintln(worker.tupleSendConn, out.output)
 						if err != nil {
 							fmt.Println("error sending tuple to leader", err)
-							worker.taskOutputs <- out // Re-queue the tuple so it isn't lost
+							go func(t taskOutput) {
+								time.Sleep(100 * time.Millisecond) // Wait a bit
+								worker.taskOutputs <- t
+							}(out) // Re-queue the tuple so it isn't lost
 						}
 					}
 				}
@@ -294,16 +312,35 @@ func main() {
 
 						// write to task
 						worker.tasksLocker.Lock()
-						if t, ok := worker.tasks[targetTask]; ok && t.input != nil {
-							_, err = io.WriteString(t.input, split[3])
-							if worker.tasks[targetTask].inputRate == 0 {
-								worker.tasks[targetTask].startTime = time.Now()
-							}
-							worker.tasks[targetTask].inputRate++
-						} else {
-							err = errors.New("pipe close")
+						var taskInput io.Writer
+						t, ok := worker.tasks[targetTask]
+						if ok {
+							taskInput = t.input
 						}
-						worker.tasksLocker.Unlock()
+						worker.tasksLocker.Unlock() // <--- RELEASE LOCK IMMEDIATELY
+
+						// 2. Perform Blocking I/O OUTSIDE the lock
+						if taskInput != nil {
+							_, err = io.WriteString(taskInput, split[3])
+							if err != nil {
+								continue // Write failed
+							}
+
+							// 3. Re-acquire Lock to update stats (optional but safe)
+							worker.tasksLocker.Lock()
+							if t, ok := worker.tasks[targetTask]; ok {
+								if t.inputRate == 0 {
+									t.startTime = time.Now()
+								}
+								t.inputRate++
+							}
+							worker.tasksLocker.Unlock()
+						} else {
+							// Task didn't exist or input was nil
+							// Send ACK anyway to prevent sender from spinning?
+							// Or just continue (sender will retry)
+							continue
+						}
 						if err != nil {
 							continue // we weren't able to write, so no ack
 						}
@@ -462,15 +499,16 @@ func getOutboundIP() net.IP {
 }
 
 func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
-	w.tasksLocker.RLock()
+	w.tasksLocker.Lock()
+	w.finishedStages[stage] = true // Record the completion
 	var inputsToClose []io.WriteCloser
 	for key, value := range w.tasks {
 		if key.Stage == stage+1 {
 			inputsToClose = append(inputsToClose, value.input)
 		}
 	}
-	w.tasksLocker.RUnlock()
-
+	w.tasksLocker.Unlock()
+	println("Received stage ", stage, " completed")
 	for _, input := range inputsToClose {
 		_ = input.Close()
 	}
@@ -505,6 +543,7 @@ func (w *Worker) Initialize(args InitArgs, reply *int) error {
 }
 
 func (w *Worker) ReceiveIPs(ips []map[int]*TaskInfo, reply *int) error {
+	println("received new IPS")
 	w.taskIDLocker.Lock()
 	defer w.taskIDLocker.Unlock()
 
@@ -655,6 +694,17 @@ func (w *Worker) AddTask(t Task, reply *int) error {
 			}
 		}
 	}
+
+	w.tasksLocker.RLock()
+	isPrevStageDone := w.finishedStages[t.Stage-1]
+	w.tasksLocker.RUnlock()
+
+	if isPrevStageDone {
+		// If Stage 0 is done, we must close the input immediately
+		// so the task processes what it has and then exits.
+		_ = taskStdin.Close()
+	}
+
 	*reply = task.Process.Pid
 	return nil
 }
