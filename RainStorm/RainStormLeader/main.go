@@ -321,76 +321,101 @@ func main() {
 				r.Lock.Unlock()
 			}()
 
-			for {
-				select {
-				case <-ctx.Done():
-					for _, c := range tupleClients {
-						c.Conn.Close()
-					}
-					return
+			// Tracks a tuple we failed to send and need to retry
+			var pendingTuple *struct {
+				line    string
+				lineNum int
+			}
 
-				case tuple := <-readingChan:
-					if tuple.lineNum == -1 {
-						r.sendStageCompletion(-1)
+			for {
+				// Definition of the tuple variable for this iteration
+				var tuple struct {
+					line    string
+					lineNum int
+				}
+
+				// --- SELECTION LOGIC ---
+				if pendingTuple != nil {
+					// 1. Prioritize the retry
+					tuple = *pendingTuple
+					pendingTuple = nil
+				} else {
+					// 2. Otherwise read from channel
+					select {
+					case <-ctx.Done():
 						for _, c := range tupleClients {
 							c.Conn.Close()
 						}
 						return
+					case t := <-readingChan:
+						tuple = t // FIX 1: use '=' not ':='
 					}
+				}
 
-					// ... [Update Logic] ...
-					select {
-					case updatedMap := <-r.Stage1UpdatesChan:
-						firstStageTasks = updatedMap
-						firstTaskList = make([]int, 0)
-						for k := range firstStageTasks {
-							firstTaskList = append(firstTaskList, k)
-						}
-						sort.Ints(firstTaskList)
-					default:
+				if tuple.lineNum == -1 {
+					r.sendStageCompletion(-1)
+					for _, c := range tupleClients {
+						c.Conn.Close()
 					}
+					return
+				}
 
-					// Fix Divide By Zero
-					if len(firstTaskList) == 0 {
-						time.Sleep(50 * time.Millisecond)
-						readingChan <- tuple
-						continue
+				// ... [Update Logic] ...
+				select {
+				case updatedMap := <-r.Stage1UpdatesChan:
+					firstStageTasks = updatedMap
+					firstTaskList = make([]int, 0)
+					for k := range firstStageTasks {
+						firstTaskList = append(firstTaskList, k)
 					}
+					sort.Ints(firstTaskList)
+				default:
+				}
 
-					nextTask := firstTaskList[tuple.lineNum%len(firstTaskList)]
-					nextTaskIp := firstStageTasks[nextTask]
+				// FIX 2: Handle empty task list without deadlocking channel
+				if len(firstTaskList) == 0 {
+					time.Sleep(50 * time.Millisecond)
+					pendingTuple = &tuple // Save state
+					continue              // Retry loop
+				}
 
-					client, ok := tupleClients[nextTaskIp.String()]
-					if !ok {
-						conn, err := net.Dial("tcp", nextTaskIp.String()+TuplePort)
-						if err != nil {
-							delete(tupleClients, nextTaskIp.String())
-							continue
-						}
-						client = &WorkerClient{Conn: conn, Buf: bufio.NewReader(conn)}
-						tupleClients[nextTaskIp.String()] = client
-					}
+				nextTask := firstTaskList[tuple.lineNum%len(firstTaskList)]
+				nextTaskIp := firstStageTasks[nextTask]
 
-					_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
-					_, _ = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", "temp", tuple.lineNum, 0, nextTask, tuple.line)
-
-					_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
-					ack, err := client.Buf.ReadString('\n')
-					expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
-
-					if err != nil || strings.TrimSpace(ack) != expectedAck {
-						client.Conn.Close()
+				client, ok := tupleClients[nextTaskIp.String()]
+				if !ok {
+					conn, err := net.Dial("tcp", nextTaskIp.String()+TuplePort)
+					if err != nil {
 						delete(tupleClients, nextTaskIp.String())
-						readingChan <- tuple
+						// FIX 3: Save tuple before continuing on dial fail
+						pendingTuple = &tuple
 						continue
 					}
+					client = &WorkerClient{Conn: conn, Buf: bufio.NewReader(conn)}
+					tupleClients[nextTaskIp.String()] = client
+				}
 
-					numProcessed++
-					expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
-					targetTime := startTime.Add(expectedDuration)
-					if targetTime.After(time.Now()) {
-						time.Sleep(targetTime.Sub(time.Now()))
-					}
+				_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
+				_, _ = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", "temp", tuple.lineNum, 0, nextTask, tuple.line)
+
+				_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
+				ack, err := client.Buf.ReadString('\n')
+				expectedAck := fmt.Sprintf("%s-%d-%s", "temp", tuple.lineNum, "ACK")
+
+				if err != nil || strings.TrimSpace(ack) != expectedAck {
+					client.Conn.Close()
+					delete(tupleClients, nextTaskIp.String())
+
+					// Retry logic (already correct in your snippet, kept for clarity)
+					pendingTuple = &tuple
+					continue
+				}
+
+				numProcessed++
+				expectedDuration := time.Duration((numProcessed / r.InputRate) * float64(time.Second))
+				targetTime := startTime.Add(expectedDuration)
+				if targetTime.After(time.Now()) {
+					time.Sleep(targetTime.Sub(time.Now()))
 				}
 			}
 		}()
@@ -727,31 +752,85 @@ func processStdin(i1 chan<- RainStorm) {
 			break
 
 		case "kill_task":
-			//@TODO: add implementation for this
+			//vm := splits[1]
+			//pid, _ := strconv.Atoi(splits[2])
+			//curApp.Lock.RLock()
+			//for stageNum, stage := range curApp.TaskInformation {
+			//	done := false
+			//	for taskNum, info := range stage {
+			//		if vm == info.Ip.String() && pid == info.Pid {
+			//			rpcWorkersLock.RLock()
+			//			worker := rpcWorkers[info.Ip.String()]
+			//			var reply int
+			//			_ = worker.Call("Worker.KillTask", TaskID{
+			//				Task:  taskNum,
+			//				Stage: stageNum,
+			//			}, &reply)
+			//			rpcWorkersLock.RUnlock()
+			//			done = true
+			//			break
+			//		}
+			//	}
+			//	if done {
+			//		break
+			//	}
+			//}
+			//curApp.Lock.RUnlock()
+			//break
 			vm := splits[1]
 			pid, _ := strconv.Atoi(splits[2])
+
+			// We need to release the lock before calling ReceiveFailure to avoid Deadlock,
+			// because ReceiveFailure acquires the lock itself.
+			var foundTask bool
+			var targetTask Task
+
 			curApp.Lock.RLock()
 			for stageNum, stage := range curApp.TaskInformation {
-				done := false
 				for taskNum, info := range stage {
 					if vm == info.Ip.String() && pid == info.Pid {
-						rpcWorkersLock.RLock()
-						worker := rpcWorkers[info.Ip.String()]
-						var reply int
-						_ = worker.Call("Worker.KillTask", TaskID{
-							Task:  taskNum,
-							Stage: stageNum,
-						}, &reply)
-						rpcWorkersLock.RUnlock()
-						done = true
+						targetTask = Task{
+							TaskNumber: taskNum,
+							Stage:      stageNum,
+						}
+						foundTask = true
 						break
 					}
 				}
-				if done {
+				if foundTask {
 					break
 				}
 			}
 			curApp.Lock.RUnlock()
+
+			if foundTask {
+				// 1. Kill the physical process on the worker
+				rpcWorkersLock.RLock()
+				worker, ok := rpcWorkers[vm] // Use the vm string to find the client
+				rpcWorkersLock.RUnlock()
+
+				if ok {
+					var reply int
+					err := worker.Call("Worker.KillTask", TaskID{
+						Task:  targetTask.TaskNumber,
+						Stage: targetTask.Stage,
+					}, &reply)
+
+					if err != nil {
+						fmt.Println("Error killing task:", err)
+					} else {
+						fmt.Println("Task Killed via RPC.")
+					}
+				}
+
+				// 2. IMPORTANT: Tell the Leader to recover/reschedule immediately
+				fmt.Println("Triggering Leader Recovery...")
+				var reply int
+				// We call ReceiveFailure locally to update the map and send new IPs to everyone
+				curApp.ReceiveFailure(targetTask, &reply)
+			} else {
+				fmt.Println("Task not found to kill.")
+			}
 			break
 
 		case "list_tasks":
