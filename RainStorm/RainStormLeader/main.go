@@ -450,7 +450,7 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 			}
 			app.Stage1UpdatesChan <- temp
 		}
-		app.LogFileChan <- fmt.Sprintf("Restarting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), app.TaskInformation[task.Stage][task.TaskNumber].Pid, string(app.Ops[task.Stage].Name))
+		app.LogFileChan <- fmt.Sprintf("Restarting Task because of Failure at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), app.TaskInformation[task.Stage][task.TaskNumber].Pid, string(app.Ops[task.Stage].Name))
 		app.addTask(task.Stage, task.TaskNumber)
 		app.sendIps()
 	}
