@@ -25,7 +25,8 @@ import (
 type localTask struct {
 	cmd            *exec.Cmd
 	input          io.WriteCloser // To send tuples to tasks (receives data from tcp)
-	output         io.ReadCloser  // To send tuples to the next stage (sends data through tcp)
+	closed         bool
+	output         io.ReadCloser // To send tuples to the next stage (sends data through tcp)
 	inputRate      int
 	startTime      time.Time
 	lastCheckTime  time.Time
@@ -131,131 +132,140 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			var pendingTuple *taskOutput
+
 			for {
-				// On output of tuple from a task, send it to the next task
-				select {
-				case <-ctx.Done():
-					return
-				case out := <-worker.taskOutputs:
+				var out taskOutput
 
-					nextStage := out.taskId.Stage + 1
-					// Remote log
-					worker.logChan <- logRequest{
-						fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
-						data:     fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output),
+				// Check if we have a pending retry first
+				if pendingTuple != nil {
+					select {
+					case <-ctx.Done():
+						return
+					default:
 					}
-
-					// local log
-					worker.tasksLocker.RLock()
-					if t, ok := worker.tasks[out.taskId]; ok && t.logFile != nil {
-						_, _ = fmt.Fprintln(t.logFile, "OUTPUT: ", out.output)
-					}
-					worker.tasksLocker.RUnlock()
-					if nextStage < len(worker.ips) { // send it to the next stage
-						key := out.output
-						if worker.stageOperations[nextStage].Name == AggregateByKey {
-							hashIndex, err := strconv.Atoi(worker.stageOperations[nextStage].Args)
-							if err != nil {
-								hashIndex = 0
-							}
-							reader := csv.NewReader(strings.NewReader(out.output))
-							tuple, err := reader.Read()
-							if err == nil && hashIndex < len(tuple) {
-								key = tuple[hashIndex]
-							}
-						}
-
-						// Find which client gets the next tuple
-						worker.taskIDLocker.RLock()
-						nextStageTasks := worker.sortedTaskIDs[nextStage]
-						hash := HashString(key)
-						if hash < 0 { // make sure hash is positive
-							hash = -hash
-						}
-						nextTask := nextStageTasks[hash%len(nextStageTasks)] // Go to the sorted array and find the task #
-
-						nextWorker := worker.ips[nextStage][nextTask].Ip.String()
-						worker.taskIDLocker.RUnlock()
-
-						worker.connectionsLock.RLock()
-						client, ok := worker.connections[nextWorker]
-						worker.connectionsLock.RUnlock()
-						if !ok { // new connection,
-							// try connecting
-							conn, err := net.Dial("tcp", nextWorker+TuplePort)
-							if err != nil {
-								go func(t taskOutput) {
-									time.Sleep(100 * time.Millisecond) // Wait a bit
-									worker.taskOutputs <- t
-								}(out)
-								continue
-							}
-							newClient := &WorkerClient{
-								Conn: conn,
-								Buf:  bufio.NewReader(conn),
-							}
-
-							worker.connectionsLock.Lock()
-							// Make sure the client wasn't already added while we were dialing
-							if existing, exists := worker.connections[nextWorker]; exists {
-								// Already exists, just use that one
-								client = existing
-								conn.Close()
-							} else {
-								client = newClient
-								worker.connections[nextWorker] = client
-							}
-							worker.connectionsLock.Unlock()
-						}
-
-						// Send the tuple
-						_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
-						// Id-Id, stage, task, data
-						_, err = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
-
-						if err != nil { // Write didn't go through, disconnect and try again
-							_ = client.Conn.Close()
-							worker.connectionsLock.Lock()
-							delete(worker.connections, nextWorker)
-							worker.connectionsLock.Unlock()
-							go func(t taskOutput) {
-								time.Sleep(100 * time.Millisecond) // Wait a bit
-								worker.taskOutputs <- t
-							}(out)
-							continue
-						}
-
-						// Wait for the ack
-						_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
-						ack, err := client.Buf.ReadString('\n')
-						expectedAck := fmt.Sprintf("%s-%d-%s", out.taskId.String(), out.tupleId, ACK)
-						if err != nil || strings.TrimSpace(ack) != expectedAck {
-							go func(t taskOutput) {
-								time.Sleep(100 * time.Millisecond) // Wait a bit
-								worker.taskOutputs <- t
-							}(out) // didn't receive the ack, just try again
-						}
-					} else { // output data to the distributed file system
-						// Send the tuple to the leader, they will write to HyDFS
-						if worker.tupleSendConn == nil {
-							fmt.Println("CRITICAL ERROR: tupleSendConn is nil! Initialize hasn't run yet.")
-							go func(t taskOutput) {
-								time.Sleep(100 * time.Millisecond) // Wait a bit
-								worker.taskOutputs <- t
-							}(out) // Re-queue the tuple so it isn't lost
-							time.Sleep(100 * time.Millisecond) // Wait for Initialize
-							continue
-						}
-						_, err = fmt.Fprintln(worker.tupleSendConn, out.output)
-						if err != nil {
-							fmt.Println("error sending tuple to leader", err)
-							go func(t taskOutput) {
-								time.Sleep(100 * time.Millisecond) // Wait a bit
-								worker.taskOutputs <- t
-							}(out) // Re-queue the tuple so it isn't lost
-						}
+					out = *pendingTuple
+					pendingTuple = nil
+				} else {
+					// Otherwise read from channel
+					select {
+					case <-ctx.Done():
+						return
+					case val := <-worker.taskOutputs:
+						out = val
 					}
 				}
+
+				nextStage := out.taskId.Stage + 1
+				// Remote log
+				worker.logChan <- logRequest{
+					fileName: fmt.Sprintf("%s_%d-%d", worker.rainStormStartTime, out.taskId.Stage, out.taskId.Task),
+					data:     fmt.Sprintf("PROCESSED,%s-%d,%s\n", out.taskId.String(), out.tupleId, out.output),
+				}
+
+				// local log
+				worker.tasksLocker.RLock()
+				if t, ok := worker.tasks[out.taskId]; ok && t.logFile != nil {
+					_, _ = fmt.Fprintln(t.logFile, "OUTPUT: ", out.output)
+				}
+				worker.tasksLocker.RUnlock()
+				if nextStage < len(worker.ips) { // send it to the next stage
+					key := out.output
+					if worker.stageOperations[nextStage].Name == AggregateByKey {
+						hashIndex, err := strconv.Atoi(worker.stageOperations[nextStage].Args)
+						if err != nil {
+							hashIndex = 0
+						}
+						reader := csv.NewReader(strings.NewReader(out.output))
+						tuple, err := reader.Read()
+						if err == nil && hashIndex < len(tuple) {
+							key = tuple[hashIndex]
+						}
+					}
+
+					// Find which client gets the next tuple
+					worker.taskIDLocker.RLock()
+					nextStageTasks := worker.sortedTaskIDs[nextStage]
+					hash := HashString(key)
+					if hash < 0 { // make sure hash is positive
+						hash = -hash
+					}
+					nextTask := nextStageTasks[hash%len(nextStageTasks)] // Go to the sorted array and find the task #
+
+					nextWorker := worker.ips[nextStage][nextTask].Ip.String()
+					worker.taskIDLocker.RUnlock()
+
+					worker.connectionsLock.RLock()
+					client, ok := worker.connections[nextWorker]
+					worker.connectionsLock.RUnlock()
+					if !ok { // new connection,
+						// try connecting
+						conn, err := net.Dial("tcp", nextWorker+TuplePort)
+						if err != nil {
+							time.Sleep(100 * time.Millisecond) // Wait a bit
+							pendingTuple = &out                // Save to retry
+							continue
+						}
+						newClient := &WorkerClient{
+							Conn: conn,
+							Buf:  bufio.NewReader(conn),
+						}
+
+						worker.connectionsLock.Lock()
+						// Make sure the client wasn't already added while we were dialing
+						if existing, exists := worker.connections[nextWorker]; exists {
+							// Already exists, just use that one
+							client = existing
+							conn.Close()
+						} else {
+							client = newClient
+							worker.connections[nextWorker] = client
+						}
+						worker.connectionsLock.Unlock()
+					}
+
+					// Send the tuple
+					_ = client.Conn.SetWriteDeadline(time.Now().Add(clientTimeout))
+					// Id-Id, stage, task, data
+					_, err = fmt.Fprintf(client.Conn, "%s-%d,%d,%d,%s\n", out.taskId.String(), out.tupleId, nextStage, nextTask, out.output)
+
+					if err != nil { // Write didn't go through, disconnect and try again
+						_ = client.Conn.Close()
+						worker.connectionsLock.Lock()
+						delete(worker.connections, nextWorker)
+						worker.connectionsLock.Unlock()
+						time.Sleep(100 * time.Millisecond) // Wait a bit
+						pendingTuple = &out                // Save to retry
+						continue
+					}
+
+					// Wait for the ack
+					_ = client.Conn.SetReadDeadline(time.Now().Add(clientTimeout))
+					ack, err := client.Buf.ReadString('\n')
+					expectedAck := fmt.Sprintf("%s-%d-%s", out.taskId.String(), out.tupleId, ACK)
+					if err != nil || strings.TrimSpace(ack) != expectedAck {
+						time.Sleep(100 * time.Millisecond) // Wait a bit
+						pendingTuple = &out                // didn't receive the ack, just try again
+						continue
+					}
+				} else { // output data to the distributed file system
+					// Send the tuple to the leader, they will write to HyDFS
+					if worker.tupleSendConn == nil {
+						fmt.Println("CRITICAL ERROR: tupleSendConn is nil! Initialize hasn't run yet.")
+						time.Sleep(100 * time.Millisecond) // Wait a bit
+						pendingTuple = &out                // Save to retry
+						time.Sleep(100 * time.Millisecond) // Wait for Initialize
+						continue
+					}
+					_, err = fmt.Fprintln(worker.tupleSendConn, out.output)
+					if err != nil {
+						fmt.Println("error sending tuple to leader", err)
+						time.Sleep(100 * time.Millisecond) // Wait a bit
+						pendingTuple = &out                // Save to retry
+						continue
+					}
+				}
+
 			}
 		}()
 
@@ -395,7 +405,7 @@ func main() {
 						now := time.Now()
 						duration := now.Sub(task.lastCheckTime).Seconds()
 
-						if duration > 0 {
+						if duration > 0 && !task.closed {
 							// Calculate tuples per second over the last window
 							tuplesReceivedSinceLastTick := float64(task.inputRate - task.lastInputCount)
 							rate := tuplesReceivedSinceLastTick / duration
@@ -505,6 +515,7 @@ func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 	for key, value := range w.tasks {
 		if key.Stage == stage+1 {
 			inputsToClose = append(inputsToClose, value.input)
+			value.closed = true
 		}
 	}
 	w.tasksLocker.Unlock()
@@ -519,9 +530,13 @@ func (w *Worker) ReceiveFinishedStage(stage int, reply *int) error {
 }
 
 func (w *Worker) AutoscaleDown(t TaskID, reply *int) error {
-	w.tasksLocker.RLock()
-	defer w.tasksLocker.RUnlock()
-	_ = w.tasks[t].input.Close()
+	fmt.Println("Downscaling ", t)
+	w.tasksLocker.Lock()
+	defer w.tasksLocker.Unlock()
+	if task, ok := w.tasks[t]; ok && task.input != nil {
+		_ = task.input.Close()
+		task.closed = true
+	}
 	return nil
 }
 
