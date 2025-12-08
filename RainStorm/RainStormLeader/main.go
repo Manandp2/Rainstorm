@@ -180,9 +180,7 @@ func main() {
 		for i := range r.NumStages {
 			r.TaskInformation[i] = make(map[int]*TaskInfo)
 			for j := range r.NumTasksPerStage {
-				println("Reached")
 				r.addTask(i, j)
-				println("Added task done")
 				r.NextTaskNum[i]++
 			}
 		}
@@ -195,6 +193,8 @@ func main() {
 			RemoteName: r.HydfsDestinationFileName,
 			Content:    make([]byte, 0),
 		}, &createReply)
+		os.MkdirAll(filepath.Join(homeDir, "RainStormOutputs"), 0755)
+		localOutputFile, _ := os.OpenFile(filepath.Join(homeDir, "RainStormOutputs", r.HydfsDestinationFileName), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0666)
 
 		inputFile, err := os.Open(filepath.Join(dataDir, r.HydfsSrcDirectory))
 		if err != nil {
@@ -263,7 +263,8 @@ func main() {
 
 						// FIX 1: Always prioritize sending data if we got it
 						if len(line) > 0 {
-							fmt.Print(line)
+							//fmt.Print(line)
+							localOutputFile.WriteString(line)
 							outputChan <- line // Send. We know writer is alive until we close chan.
 						}
 
@@ -418,6 +419,7 @@ func main() {
 		}
 		rpcWorkersLock.Unlock()
 
+		localOutputFile.Close()
 		fmt.Println("RainStorm Application completed")
 	}
 }
@@ -448,7 +450,7 @@ func (app *RainStorm) ReceiveFailure(task Task, reply *int) error {
 			}
 			app.Stage1UpdatesChan <- temp
 		}
-		app.LogFileChan <- fmt.Sprintf("Restarting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), reply, string(app.Ops[task.Stage].Name))
+		app.LogFileChan <- fmt.Sprintf("Restarting Task at VM: %s PID: %d op_exe: %s\n", app.TaskInformation[task.Stage][task.TaskNumber].Ip.String(), app.TaskInformation[task.Stage][task.TaskNumber].Pid, string(app.Ops[task.Stage].Name))
 		app.addTask(task.Stage, task.TaskNumber)
 		app.sendIps()
 	}
@@ -754,16 +756,13 @@ func processStdin(i1 chan<- RainStorm) {
 
 		case "list_tasks":
 			//@TODO print local log file for task
-			println("Lsiting tasks")
 			curApp.Lock.RLock()
-			println("readj")
 			for stageNum, stage := range curApp.TaskInformation {
 				for _, info := range stage {
 					fmt.Printf("%s %d %s\n", info.Ip.String(), info.Pid, curApp.Ops[stageNum])
 				}
 			}
 			curApp.Lock.RUnlock()
-			println("Finished")
 			break
 
 		}
