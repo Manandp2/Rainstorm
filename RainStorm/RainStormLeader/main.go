@@ -487,6 +487,12 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 	app.LogFileChan <- fmt.Sprintf("Rate: %.2f TaskID: %d Stage %d\n", args.Rate, args.Task, args.Stage)
 	if app.AutoScale {
 		if args.Rate < app.LowestRate {
+			//	remove a task from this stage
+			app.Lock.Lock()
+			app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
+			app.removeTask(args.Stage)
+			app.Lock.Unlock()
+		} else if args.Rate > app.HighestRate {
 			//	add a task to this stage
 			app.Lock.Lock()
 			taskNum := app.NextTaskNum[args.Stage]
@@ -494,12 +500,6 @@ func (app *RainStorm) ReceiveRateUpdate(args RmUpdate, reply *int) error {
 			app.LogFileChan <- fmt.Sprintf("Upscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
 			app.addTask(args.Stage, taskNum)
 			app.sendIps()
-			app.Lock.Unlock()
-		} else if args.Rate > app.HighestRate {
-			//	remove a task from this stage
-			app.Lock.Lock()
-			app.LogFileChan <- fmt.Sprintf("Downscaling Stage: %d Rate: %.2f\n", args.Stage, args.Rate)
-			app.removeTask(args.Stage)
 			app.Lock.Unlock()
 		}
 	}
